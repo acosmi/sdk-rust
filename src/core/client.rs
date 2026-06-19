@@ -11,10 +11,18 @@
 
 use crate::auth::auth as oauth;
 use crate::auth::types::{token_set_is_expired, ServerMetadata, TokenSet};
+use crate::core::http::{
+    parse_http_error_with_retry_after, read_limited_text, MAX_ERROR_BODY_SIZE, MODEL_CACHE_TTL_MS,
+};
 use crate::core::retry::{effective_policy, EffectiveRetryPolicy, RetryPolicy};
 use crate::core::store::{FileTokenStore, InMemoryTokenStore, TokenStore};
 use crate::macros::open_string_union;
+use crate::models::types::{
+    zero_model_capabilities, InputModality, ManagedModel, ModelCapabilities, QuotaSummary,
+};
+use crate::shared::api_response::ApiResponse;
 use crate::shared::errors::{Error, Result};
+use serde::de::DeserializeOwned;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -115,6 +123,10 @@ struct ClientInner {
 
     // ── 可变状态 ──
     tokens: RwLock<Option<TokenSet>>,
+    /// 模型列表缓存（缺省模式 list_models 写入，全集模式不写）。对应 TS `modelCache`。
+    model_cache: RwLock<Vec<crate::models::ManagedModel>>,
+    /// 模型缓存写入时刻（TTL 判定基准）。对应 TS `modelCacheTimeMs`。
+    model_cache_time: RwLock<Option<std::time::Instant>>,
     /// lazy 加载的 OAuth server 元数据（discover 结果缓存）。
     meta: RwLock<Option<ServerMetadata>>,
     /// login 进行中标志（单航班）。`ensure_token` 在 tokens==null 时据此决定是否等待。
@@ -174,6 +186,8 @@ impl Client {
                 store,
                 retry_policy,
                 tokens: RwLock::new(None),
+                model_cache: RwLock::new(Vec::new()),
+                model_cache_time: RwLock::new(None),
                 meta: RwLock::new(None),
                 login_in_flight: AtomicBool::new(false),
                 mu: tokio::sync::Mutex::new(()),
@@ -768,6 +782,244 @@ impl Client {
             *self.inner.tokens.write().unwrap() = Some(on_disk);
         }
     }
+
+    // ===========================================================================
+    // URL 拼接（对应 TS apiURL）
+    // ===========================================================================
+
+    /// 业务 API URL 拼接。`api_base_url` 覆盖（未配置时 === server_url）；尾段非 `/api/v4` 时追加。
+    /// 对应 TS `apiURL`。
+    pub fn api_url(&self, path: &str) -> String {
+        let mut base = self
+            .inner
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| self.inner.server_url.clone());
+        if !base.ends_with("/api/v4") {
+            base.push_str("/api/v4");
+        }
+        base.push_str(path);
+        base
+    }
+
+    // ===========================================================================
+    // 通用 JSON GET（最小 do_json_get：GET + Bearer + ApiResponse 解包 + 401 单次重试）
+    // ===========================================================================
+
+    /// GET 请求并反序列化为 `T`，同时返回响应头。对应 TS `doJSONFull<T>('GET',...)` 的 GET 子集。
+    ///
+    /// 行为对齐 `doJSONFullInternal`：ensure_token → Bearer → 非 2xx 抛 HttpError（含 Retry-After）→
+    /// 401 单次 force_refresh 重试 → 空 body 跳业务码（这里 GET 端点都返回 ApiResponse，调用方自处理）→
+    /// JSON 反序列化 + 业务码检查（`code != 0` 抛 BusinessError）。
+    async fn do_json_get_full<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        signal: Option<CancellationToken>,
+    ) -> Result<(T, reqwest::header::HeaderMap)> {
+        self.do_json_get_internal(path, signal, false).await
+    }
+
+    async fn do_json_get_internal<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        signal: Option<CancellationToken>,
+        retried: bool,
+    ) -> Result<(T, reqwest::header::HeaderMap)> {
+        let token = self.ensure_token(signal.clone()).await?;
+        let url = self.api_url(path);
+
+        let send = self
+            .http()
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .send();
+        let resp = match &signal {
+            Some(cancel) => tokio::select! {
+                r = send => r,
+                _ = cancel.cancelled() => {
+                    return Err(Error::other(format!("GET {path}: aborted")));
+                }
+            },
+            None => send.await,
+        }
+        .map_err(|e| {
+            Error::Network(crate::core::http::classify_transport(
+                &format!("GET {path}"),
+                &url,
+                &e,
+            ))
+        })?;
+
+        let status = resp.status();
+
+        // 401：单次 force_refresh 重试（防递归）。
+        if status.as_u16() == 401 && !retried {
+            self.force_refresh(signal.clone())
+                .await
+                .map_err(|e| Error::other(format!("unauthorized and refresh failed: {e}")))?;
+            return Box::pin(self.do_json_get_internal(path, signal, true)).await;
+        }
+
+        if !status.is_success() {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&s| s > 0)
+                .unwrap_or(0);
+            let body = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+            return Err(Error::Http(parse_http_error_with_retry_after(
+                status.as_u16(),
+                &body,
+                retry_after,
+            )));
+        }
+
+        let headers = resp.headers().clone();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::other(format!("GET {path}: read body: {e}")))?;
+        if text.is_empty() {
+            // 空 body 成功响应 —— ApiResponse<T> 端点不应空体；按强类型显式 Err（方案 §4.4）。
+            return Err(Error::other(format!("GET {path}: empty response body")));
+        }
+        let result: T = serde_json::from_str(&text)
+            .map_err(|e| Error::other(format!("GET {path}: decode: {e}")))?;
+        Ok((result, headers))
+    }
+
+    // ===========================================================================
+    // Managed Models
+    // ===========================================================================
+
+    /// 获取可用的托管模型列表。对应 TS `listModels`。
+    ///
+    /// 不返回 entitlement-filter-status header；想据 fallback 状态显示降级提示请改用
+    /// [`Self::list_models_with_status`]。`include_locked=true` 请求全集模式（picker=1）。
+    pub async fn list_models(
+        &self,
+        signal: Option<CancellationToken>,
+        include_locked: bool,
+    ) -> Result<Vec<ManagedModel>> {
+        Ok(self
+            .list_models_with_status(signal, include_locked)
+            .await?
+            .0)
+    }
+
+    /// 获取可用模型列表，同时返回 `X-Entitlement-Filter-Status` header。对应 TS `listModelsWithStatus`。
+    ///
+    /// `include_locked=true` → 全集模式（picker=1，含越档 locked 模型供 picker 展示），
+    /// **不写** model_cache（避免 locked 模型混入可用集）；缺省模式照旧缓存。
+    pub async fn list_models_with_status(
+        &self,
+        signal: Option<CancellationToken>,
+        include_locked: bool,
+    ) -> Result<(Vec<ManagedModel>, FilterStatus)> {
+        let path = if include_locked {
+            "/managed-models?picker=1"
+        } else {
+            "/managed-models"
+        };
+        let (result, headers): (ApiResponse<Vec<ManagedModel>>, _) =
+            self.do_json_get_full(path, signal).await?;
+        if let Some(err) = result.business_error() {
+            return Err(err);
+        }
+        // v1.2：写缓存前归一化 input_modalities（snake）→ input_modalities（camel `inputModalities`）。
+        let normalized = normalize_input_modalities(result.data);
+
+        if !include_locked {
+            *self.inner.model_cache.write().unwrap() = normalized.clone();
+            *self.inner.model_cache_time.write().unwrap() = Some(std::time::Instant::now());
+        }
+
+        let status: FilterStatus = headers
+            .get("X-Entitlement-Filter-Status")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(FilterStatus::from)
+            .unwrap_or_else(|| FilterStatus::UNKNOWN.into());
+        Ok((normalized, status))
+    }
+
+    /// 查询当前用户账户级权益总览（v0.19+）。对应 TS `getQuotaSummary`。
+    pub async fn get_quota_summary(
+        &self,
+        signal: Option<CancellationToken>,
+    ) -> Result<QuotaSummary> {
+        let (resp, _): (ApiResponse<QuotaSummary>, _) = self
+            .do_json_get_full("/entitlements/quota-summary", signal)
+            .await?;
+        if let Some(err) = resp.business_error() {
+            return Err(err);
+        }
+        Ok(resp.data)
+    }
+
+    /// 查询单个模型的能力矩阵。优先从 list_models 缓存读取，miss 时刷新一次。
+    /// 对应 TS `getModelCapabilities`。仍 miss → 零值（与 Go/TS 一致）。
+    pub async fn get_model_capabilities(
+        &self,
+        model_id: &str,
+        signal: Option<CancellationToken>,
+    ) -> Result<ModelCapabilities> {
+        if let Some(caps) = self.cached_capabilities(model_id) {
+            return Ok(caps);
+        }
+        self.list_models(signal, false).await?;
+        if let Some(caps) = self.cached_capabilities(model_id) {
+            return Ok(caps);
+        }
+        // 模型不在列表中，返回零值。
+        Ok(zero_model_capabilities())
+    }
+
+    /// 从缓存查 capabilities（缓存空或过 TTL → None）。对应 TS `getCachedCapabilities`。
+    fn cached_capabilities(&self, model_id: &str) -> Option<ModelCapabilities> {
+        let cache = self.inner.model_cache.read().unwrap();
+        let time = *self.inner.model_cache_time.read().unwrap();
+        let expired = match time {
+            Some(t) => t.elapsed().as_millis() as u64 > MODEL_CACHE_TTL_MS,
+            None => true,
+        };
+        if cache.is_empty() || expired {
+            return None;
+        }
+        for m in cache.iter() {
+            if m.id == model_id || m.model_id == model_id {
+                return Some(m.capabilities.clone());
+            }
+        }
+        None
+    }
+}
+
+/// 归一化上游 ManagedModel 列表的 `input_modalities`（snake）→ `inputModalities`（camel）。
+/// 对应 TS `normalizeInputModalities`：camelCase 已存在则保留；仅 snake 存在时拷贝并滤白名单；
+/// 都没有则保 `None`（"未声明" ≠ text-only）。
+fn normalize_input_modalities(mut models: Vec<ManagedModel>) -> Vec<ManagedModel> {
+    for m in models.iter_mut() {
+        if m.input_modalities.is_some() {
+            // camelCase 已存在 —— 清掉 snake 镜像字段，避免重复持有。
+            m.input_modalities_snake = None;
+            continue;
+        }
+        if let Some(snake) = m.input_modalities_snake.take() {
+            let filtered: Vec<InputModality> = snake
+                .into_iter()
+                .filter_map(|v| match v.as_str() {
+                    Some("text") => Some(InputModality::Text),
+                    Some("image") => Some(InputModality::Image),
+                    _ => None,
+                })
+                .collect();
+            m.input_modalities = Some(filtered);
+        }
+    }
+    models
 }
 
 /// 浏览器 OAuth CORS 错误启发式判定（对应 TS `isLikelyBrowserOAuthCORSError`）。

@@ -34,6 +34,7 @@ mod macros;
 // notifications/agent_runs(P5) / compliance/support(P6) / 商品化(P7) / sanitize(P8)。
 pub mod auth;
 pub mod core;
+pub mod models;
 pub mod shared;
 
 // 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
@@ -50,7 +51,27 @@ pub use crate::auth::{
     WebAuthorizationCallbackParams, WebAuthorizationPending, WebAuthorizationRequest,
 };
 pub use crate::core::{
-    Client, Config, FileTokenStore, InMemoryTokenStore, TokenStore, DEFAULT_GATEWAY_BASE_URL,
+    Client, Config, FileTokenStore, FilterStatus, InMemoryTokenStore, TokenStore,
+    DEFAULT_GATEWAY_BASE_URL,
+};
+// === models 域逐项 re-export（对齐 models/index.ts）===
+pub use crate::models::{
+    anthropic_response_text_content, anthropic_response_thinking_content,
+    anthropic_response_tool_use_blocks, bucket_info_is_commercial, bucket_row_is_commercial,
+    build_betas, extract_anthropic_block_meta, find_desktop_visual_understanding_model,
+    find_first_model_by_input_modality, get_adapter, get_adapter_for_model, is_sse_comment_line,
+    model_supports_image_input, model_supports_input_modality, new_openai_stream_converter,
+    new_thinking_config, new_web_search_tool, parse_settlement, parse_sources_event, unique_merge,
+    validate_end_user_id, zero_model_capabilities, Adapter, AnthropicContentBlock,
+    AnthropicResponse, AnthropicUsage, BlockMeta, BucketInfo, BucketRow, ChatContentBlock,
+    ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig, GeoLoc,
+    ImageGenerationRequest, ImageGenerationResponse, InputModality, ManagedModel,
+    ModelCapabilities, OpenAIChatChoice, OpenAIChatMessage, OpenAIChatResponse, OpenAIFunctionCall,
+    OpenAIStreamChoice, OpenAIStreamChunk, OpenAIStreamConverter, OpenAIStreamDelta,
+    OpenAIStreamToolCall, OpenAIToolCall, OpenAIUsage, OutputConfig, ProviderFormat, QuotaSummary,
+    ServerTool, SourcesEvent, StreamEvent, StreamSettlement, ThinkingConfig,
+    VideoGenerationRequest, VideoTaskResponse, WebSearchConfig, WebSearchSource,
+    MAX_END_USER_ID_LENGTH, SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
 };
 pub use shared::{Error, Result};
 
