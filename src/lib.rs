@@ -26,11 +26,21 @@
 /// SDK 版本（对齐 npm `@acosmi/sdk-ts` 主线 / `Cargo.toml` package.version）。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+mod macros;
+
 // === 业务域 module（P1→P8 分阶段填充）===
-// 当前为 P0 脚手架：仅骨架与版本常量，保证 cargo build/clippy/test 全绿。
-// P1 起依次加入：shared / core / auth / models(+adapters) / billing / skills /
-// notifications / agent_runs / compliance / support / subscription / pricing /
-// products / casehall / enterprise / finance / chatbridge / sanitize。
+// 已落地：shared（错误体系 + 跨域 DTO）/ core（http/retry/store/client 骨架）/ auth（types 前置）。
+// 待加入：auth 全量(P2) / models(+adapters)(P3) / chat+SSE(P4) / billing/skills/
+// notifications/agent_runs(P5) / compliance/support(P6) / 商品化(P7) / sanitize(P8)。
+pub mod auth;
+pub mod core;
+pub mod shared;
+
+// 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
+pub use crate::core::{
+    Client, Config, FileTokenStore, InMemoryTokenStore, TokenStore, DEFAULT_GATEWAY_BASE_URL,
+};
+pub use shared::{Error, Result};
 
 #[cfg(test)]
 mod scaffold_tests {
