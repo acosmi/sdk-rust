@@ -33,9 +33,12 @@ mod macros;
 // 待加入：auth 全量(P2) / models(+adapters)(P3) / chat+SSE(P4) / billing/skills/
 // notifications/agent_runs(P5) / compliance/support(P6) / 商品化(P7) / sanitize(P8)。
 pub mod auth;
+pub mod billing;
 pub mod core;
 pub mod models;
+pub mod notifications;
 pub mod shared;
+pub mod skills;
 
 // 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
 pub use crate::auth::{
@@ -72,6 +75,25 @@ pub use crate::models::{
     ServerTool, SourcesEvent, StreamEvent, StreamSettlement, ThinkingConfig,
     VideoGenerationRequest, VideoTaskResponse, WebSearchConfig, WebSearchSource,
     MAX_END_USER_ID_LENGTH, SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
+};
+// === billing 域逐项 re-export（对齐 billing/index.ts）===
+pub use crate::billing::{
+    BalanceDetail, BalanceDetailEntitlement, BuyResponse, ConsumeRecord, ConsumeRecordPage,
+    EntitlementBalance, EntitlementItem, ModelBucket, ModelByQuotaResponse, ModelCoefficient,
+    Order, OrderListItem, OrderStatus, PayPayload, PaymentMethod, TokenPackage, Transaction,
+    WalletStats,
+};
+// === skills 域逐项 re-export（对齐 skills/index.ts）===
+pub use crate::skills::{
+    CertificationStatus, GenerateSkillRequest, GenerateSkillResult, OptimizeSkillRequest,
+    OptimizeSkillResult, SkillBrowseListResponse, SkillBrowseResponse, SkillDownload,
+    SkillStoreItem, SkillStoreListItem, SkillStoreQuery, SkillSummary, ToolListResponse,
+    ToolProvider, ToolView,
+};
+// === notifications 域逐项 re-export（对齐 notifications/index.ts）===
+pub use crate::notifications::{
+    parse_notification_event, DeviceRegistration, Notification, NotificationList,
+    NotificationPreference, NotificationUnreadCount, WSConfig, WSEvent,
 };
 pub use shared::{Error, Result};
 

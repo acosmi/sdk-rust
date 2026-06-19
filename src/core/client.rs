@@ -146,6 +146,12 @@ struct ClientInner {
     mu: tokio::sync::Mutex<()>,
     /// login 就绪信号（等待方解阻塞）。login 成功 / token 写入后 `notify_waiters()`。
     token_ready: tokio::sync::Notify,
+    /// V29 模型系数缓存（TTL 8s；对应 TS `coefCacheData`/`coefCacheTimeMs`）。
+    /// `@deprecated` 系数已退役（网关恒返回 `[]`），仅向后兼容。
+    coef_cache: RwLock<Option<(Vec<crate::billing::ModelCoefficient>, std::time::Instant)>>,
+    /// 当前 WebSocket 长连接状态句柄（对应 TS `this.ws`）。`None` = 未连接。
+    /// 重复 connect 前先 disconnect 旧连接（防 ws-reconnect-leak）。
+    ws: tokio::sync::Mutex<Option<crate::notifications::WsHandle>>,
 }
 
 /// 主 API 客户端。`Clone` 廉价（内部 `Arc`）。
@@ -203,6 +209,8 @@ impl Client {
                 login_in_flight: AtomicBool::new(false),
                 mu: tokio::sync::Mutex::new(()),
                 token_ready: tokio::sync::Notify::new(),
+                coef_cache: RwLock::new(None),
+                ws: tokio::sync::Mutex::new(None),
             }),
         })
     }
@@ -266,6 +274,18 @@ impl Client {
     /// 共享 HTTP client（内部 / 业务方法使用）。
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.inner.http
+    }
+
+    /// V29 系数缓存槽（billing/entitlements 业务方法用）。
+    pub(crate) fn coef_cache(
+        &self,
+    ) -> &RwLock<Option<(Vec<crate::billing::ModelCoefficient>, std::time::Instant)>> {
+        &self.inner.coef_cache
+    }
+
+    /// 当前 WebSocket 状态槽（notifications/ws 业务方法用）。
+    pub(crate) fn ws_slot(&self) -> &tokio::sync::Mutex<Option<crate::notifications::WsHandle>> {
+        &self.inner.ws
     }
 
     /// 生效重试策略（`None` = 禁用）。
@@ -820,12 +840,61 @@ impl Client {
     /// 行为对齐 `doJSONFullInternal`：ensure_token → Bearer → 非 2xx 抛 HttpError（含 Retry-After）→
     /// 401 单次 force_refresh 重试 → 空 body 跳业务码（这里 GET 端点都返回 ApiResponse，调用方自处理）→
     /// JSON 反序列化 + 业务码检查（`code != 0` 抛 BusinessError）。
-    async fn do_json_get_full<T: DeserializeOwned>(
+    pub(crate) async fn do_json_get_full<T: DeserializeOwned>(
         &self,
         path: &str,
         signal: Option<CancellationToken>,
     ) -> Result<(T, reqwest::header::HeaderMap)> {
         self.do_json_get_internal(path, signal, false).await
+    }
+
+    /// 公共端点 GET（**无 token**，对应 TS `doPublicJSON`）。skill-store 浏览/详情/resolve 用。
+    ///
+    /// 不附 Authorization（公共端点），不做 401 force_refresh 重试（无凭证可刷）。
+    /// 非 2xx → [`Error::Http`]；空体 → 强 Err（公共 ApiResponse 端点不应空体）。
+    pub(crate) async fn do_public_json_full<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        signal: Option<CancellationToken>,
+    ) -> Result<T> {
+        let url = self.api_url(path);
+        let send = self.http().get(&url).send();
+        let resp = match &signal {
+            Some(cancel) => tokio::select! {
+                r = send => r,
+                _ = cancel.cancelled() => {
+                    return Err(Error::other(format!("GET {path}: aborted")));
+                }
+            },
+            None => send.await,
+        }
+        .map_err(|e| {
+            Error::Network(crate::core::http::classify_transport(
+                &format!("GET {path}"),
+                &url,
+                &e,
+            ))
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after_secs(resp.headers());
+            let body = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+            return Err(Error::Http(parse_http_error_with_retry_after(
+                status.as_u16(),
+                &body,
+                retry_after,
+            )));
+        }
+
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::other(format!("GET {path}: read body: {e}")))?;
+        if text.is_empty() {
+            return Err(Error::other(format!("GET {path}: empty response body")));
+        }
+        serde_json::from_str(&text).map_err(|e| Error::other(format!("GET {path}: decode: {e}")))
     }
 
     async fn do_json_get_internal<T: DeserializeOwned>(
@@ -1162,7 +1231,7 @@ impl Client {
     /// 行为：ensure_token → Bearer → [`Self::do_request_with_retry`]（POST 默认不重试）→
     /// 401 单次 force_refresh 重试（`retried` guard 防递归）→ 非 2xx 抛 [`Error::Http`]（含 Retry-After）→
     /// 读 body bytes。
-    async fn do_json_full_raw(
+    pub(crate) async fn do_json_full_raw(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -1234,8 +1303,7 @@ impl Client {
     /// 空 body：返回 `Ok((None, headers))`（调用方据返回类型决定是否容忍）；
     /// 非空 body：反序列化 `T`，若 `T` 含 `code` 字段且 `code != 0` 抛 BusinessError。
     /// 这里返回 `Option<T>`，让调用方对空体显式处理（与 GET-only `do_json_get_full` 的强 Err 互补）。
-    #[allow(dead_code)]
-    async fn do_json_full<T: DeserializeOwned>(
+    pub(crate) async fn do_json_full<T: DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -1841,7 +1909,7 @@ impl Client {
 
     /// 派生 per-request 超时子 token：超时或 parent 取消任一触发即 abort。对应 TS `withRequestTimeout`。
     /// 流式 / 下载路径不应套此短超时（会切断长连接），故仅在非流式 JSON 路径使用。
-    fn derive_timeout_token(
+    pub(crate) fn derive_timeout_token(
         &self,
         timeout_ms: u64,
         parent: Option<CancellationToken>,

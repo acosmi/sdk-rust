@@ -22,7 +22,7 @@ path = "src/lib.rs"
 #   - 双 adapter（Anthropic + OpenAI）等地位红线，恒编译，不 feature-gate
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -39,6 +39,10 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
+# notifications WebSocket：长连接（对齐 Go gorilla/websocket）。与 reqwest 同 rustls backend
+# （webpki-roots，无 native-tls），仅这一个 WS dep。futures-util 用于 SinkExt/StreamExt（split + send）。
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
