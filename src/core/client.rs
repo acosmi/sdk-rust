@@ -1122,7 +1122,7 @@ impl Client {
     ///
     /// 传输层错误经 [`classify_transport`] 转 [`Error::Network`]（便于 retry policy 判定）。
     /// 取消信号经 `select!` 接入。**流式路径必须直接走此函数**，绝不经 [`Self::do_request_with_retry`]。
-    async fn do_request(
+    pub(crate) async fn do_request(
         &self,
         method: reqwest::Method,
         url: &str,

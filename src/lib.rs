@@ -32,6 +32,7 @@ mod macros;
 // 已落地：shared（错误体系 + 跨域 DTO）/ core（http/retry/store/client 骨架）/ auth（types 前置）。
 // 待加入：auth 全量(P2) / models(+adapters)(P3) / chat+SSE(P4) / billing/skills/
 // notifications/agent_runs(P5) / compliance/support(P6) / 商品化(P7) / sanitize(P8)。
+pub mod agent_runs;
 pub mod auth;
 pub mod billing;
 pub mod core;
@@ -94,6 +95,17 @@ pub use crate::skills::{
 pub use crate::notifications::{
     parse_notification_event, DeviceRegistration, Notification, NotificationList,
     NotificationPreference, NotificationUnreadCount, WSConfig, WSEvent,
+};
+// === agent-runs 域逐项 re-export（对齐 agent-runs/index.ts）===
+pub use crate::agent_runs::{
+    is_terminal_remote_event, parse_remote_control_event, AdapterKind, AgentRun, AgentRunArtifact,
+    AgentRunArtifactPolicy, AgentRunCreateRequest, AgentRunCreateResponse, AgentRunDownload,
+    AgentRunErrorPayload, AgentRunListOptions, AgentRunListResult, AgentRunLocalContextPolicy,
+    AgentRunLocalToolResult, AgentRunRunOptions, AgentRunSettlement, AgentRunStatus,
+    AgentRunStreamEvent, AgentRunStreamOptions, AgentRunUsage, AgentRunWithLocalToolsOptions,
+    AgentRunsClient, ByokCreateRequest, ByokCredential, CrabCodeByokClient, LocalToolContext,
+    PermissionPolicy, RemoteControlEvent, RemotePermissionResultRequest, RemoteSessionTokenGrant,
+    RemoteUserMessageAck, RemoteUserMessageRequest, RunnerKind, WorkspacePolicy,
 };
 pub use shared::{Error, Result};
 

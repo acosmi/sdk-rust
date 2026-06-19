@@ -190,6 +190,16 @@ pub enum Error {
     #[error(transparent)]
     Stream(#[from] StreamError),
 
+    /// agent run SSE `error` 事件（`throwOnError` 为 true 时抛出）。对应 TS `AgentRunStreamError`。
+    /// 携带 stage/code/retryable 供调用方判定。
+    #[error("agent run failed: {}{message}", stage.as_ref().map(|s| format!("{s}: ")).unwrap_or_default())]
+    AgentRunStream {
+        code: String,
+        stage: Option<String>,
+        message: String,
+        retryable: bool,
+    },
+
     /// OAuth token 端点（exchange / refresh）结构化错误。对应 TS `OAuthTokenEndpointError`。
     /// 携带 OAuth `error` 码用于 `is_invalid_grant_error` 判定。
     #[error(transparent)]
