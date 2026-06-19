@@ -187,7 +187,11 @@ impl Client {
         let http = match cfg.http {
             Some(c) => c,
             None => reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(DEFAULT_API_TIMEOUT_MS))
+                // 🔴 绝不设 client 级 `.timeout(...)`：reqwest 的 timeout 覆盖整个响应体（含 SSE 流）
+                // 的总死线，会 abort >60s 的流式 SSE，也会抢先砍掉 11min 非流式 chat 的 per-request
+                // 死线（TS 用 fetch 无 client 级总超时）。死线一律靠 per-request `derive_timeout_token`
+                // （非流式）/ 调用方 signal（流式保长连接）派生。这里仅兜底连接握手。
+                .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(Error::from)?,
         };
@@ -876,6 +880,9 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         let url = self.api_url(path);
+        // per-request 死线（对齐 TS doPublicJSON 30s）：去掉 client 级总超时后，公共 GET 必须
+        // 自派生 30s 子 token，否则变无超时。超时或 parent signal 取消任一触发即 abort。
+        let signal = self.derive_timeout_token(DEFAULT_JSON_TIMEOUT_MS, signal);
         let send = self.http().get(&url).send();
         let resp = match &signal {
             Some(cancel) => tokio::select! {
@@ -921,7 +928,10 @@ impl Client {
         signal: Option<CancellationToken>,
         retried: bool,
     ) -> Result<(T, reqwest::header::HeaderMap)> {
-        let token = self.ensure_token(signal.clone()).await?;
+        // per-request 死线（对齐 TS doJSONGet 30s）：去掉 client 级总超时后，GET 必须自派生 30s
+        // 子 token，否则变无超时。401 重试沿用原 `signal` 各自重新派生（见下方递归调用）。
+        let req_signal = self.derive_timeout_token(DEFAULT_JSON_TIMEOUT_MS, signal.clone());
+        let token = self.ensure_token(req_signal.clone()).await?;
         let url = self.api_url(path);
 
         let send = self
@@ -929,7 +939,7 @@ impl Client {
             .get(&url)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
             .send();
-        let resp = match &signal {
+        let resp = match &req_signal {
             Some(cancel) => tokio::select! {
                 r = send => r,
                 _ = cancel.cancelled() => {
@@ -948,7 +958,8 @@ impl Client {
 
         let status = resp.status();
 
-        // 401：单次 force_refresh 重试（防递归）。
+        // 401：单次 force_refresh 重试（防递归）。重试沿用原 `signal`（非派生子 token），
+        // 递归入口会重新派生新的 30s 死线。
         if status.as_u16() == 401 && !retried {
             self.force_refresh(signal.clone())
                 .await
@@ -2469,5 +2480,191 @@ mod p4_tests {
             3,
             "guard prevents recursion"
         );
+    }
+
+    // ── 超时回归（真实时钟 + 控制组对照）──
+    //
+    // 设计：reqwest 内部计时器（含 connect_timeout）与 tokio paused 虚拟时钟混用会
+    // 不确定地抢先误触，故这些回归测试用真实时钟 + 小间隔，并用「控制组 client（显式
+    // 短全局 .timeout()）会被砍」对照「默认 client（无全局 .timeout()）不被砍」，
+    // 来确定性坐实：`Client::new` 默认构造的 http 没有覆盖响应体（含 SSE）的全局总超时。
+
+    /// 启一个流式 SSE mock server：建连后立即发响应头 + 第一个 chunk，随后每隔
+    /// `gap` 真实毫秒下发一个 chunk，共 `n_events` 个。用于「全局总超时是否砍响应体」对照。
+    async fn spawn_sse_mock_realtime(gap: std::time::Duration, n_events: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        tokio::spawn(async move {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Transfer-Encoding: chunked\r\n\r\n";
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = sock.flush().await;
+
+            for i in 0..n_events {
+                if i > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                let payload = format!(
+                    "event: content_block_delta\n\
+                     data: {{\"type\":\"content_block_delta\",\"index\":0,\
+                     \"delta\":{{\"type\":\"text_delta\",\"text\":\"chunk{i}\"}}}}\n\n"
+                );
+                let chunk = format!("{:x}\r\n{}\r\n", payload.len(), payload);
+                if sock.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                if sock.flush().await.is_err() {
+                    return;
+                }
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+        });
+        base
+    }
+
+    fn primed_client_with_http(base: &str, http: reqwest::Client) -> Client {
+        let client = Client::new(Config {
+            server_url: Some(base.to_string()),
+            http: Some(http),
+            ..Default::default()
+        })
+        .unwrap();
+        client.prime_tokens_for_test(unexpired_token(base));
+        client.prime_model_cache_for_test(vec![ManagedModel {
+            id: "test-model".to_string(),
+            provider: "anthropic".to_string(),
+            model_id: "test-model".to_string(),
+            is_enabled: true,
+            ..Default::default()
+        }]);
+        client
+    }
+
+    /// 控制组：显式带 250ms 全局 `.timeout()` 的 client（模拟「旧 60s 全局总超时」的语义，
+    /// 只是阈值缩小到 250ms 以便快速触发）。流式总时长跨过 250ms → 必被 reqwest abort。
+    #[tokio::test]
+    async fn stream_aborted_by_explicit_global_timeout_control() {
+        // chunk 间隔 200ms × 3 → 流式总时长 ≈ 400ms > 250ms 全局 timeout。
+        let base = spawn_sse_mock_realtime(std::time::Duration::from_millis(200), 3).await;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let client = primed_client_with_http(&base, http);
+
+        let req = ChatRequest::default();
+        let stream = client.chat_stream("test-model", &req, None);
+        futures::pin_mut!(stream);
+
+        let mut err_seen = false;
+        let mut count = 0usize;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(_) => count += 1,
+                Err(_) => {
+                    err_seen = true;
+                    break;
+                }
+            }
+        }
+        // 控制组红线：全局 .timeout() 会在响应体中途 abort SSE 流（拿不全 3 个 chunk）。
+        assert!(
+            err_seen && count < 3,
+            "带全局 .timeout() 的 client 必在流式响应体中途被 abort（got {count} chunks, err={err_seen}）"
+        );
+    }
+
+    /// 主回归：`Client::new` 默认构造的 http **无全局总超时** → 同样跨过 250ms 的流式
+    /// 响应体不被 abort，收齐全部 chunk。证明已去除击穿流式 SSE 的全局 60s 总超时。
+    #[tokio::test]
+    async fn stream_survives_long_body_no_global_timeout() {
+        // 同样的间隔/总时长（≈400ms），但用默认 client（无全局 timeout）。
+        let base = spawn_sse_mock_realtime(std::time::Duration::from_millis(200), 3).await;
+        let client = primed_client(&base); // 默认 http，无 .timeout()
+
+        let req = ChatRequest::default();
+        let stream = client.chat_stream("test-model", &req, None);
+        futures::pin_mut!(stream);
+
+        let mut events: Vec<StreamEvent> = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("默认 client 无全局总超时，流式响应体不应被 abort");
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            3,
+            "默认 client 必收齐 3 个 chunk（无全局总超时砍响应体）"
+        );
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.event, "content_block_delta");
+            assert!(ev.data.contains(&format!("chunk{i}")));
+        }
+    }
+
+    /// 非流式回归：默认 client 对「响应延迟 > 控制组 timeout」的非流式 chat 不被全局总超时砍。
+    /// 控制组（250ms 全局 timeout）会 abort；默认 client 等到响应（≈400ms）成功。
+    #[tokio::test]
+    async fn nonstream_chat_survives_slow_response_no_global_timeout() {
+        // 单次非流式响应：accept 后延迟 400ms 才回响应体。
+        async fn spawn_slow_json(delay: std::time::Duration) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let base = format!("http://{addr}");
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let body = r#"{"id":"msg_slow","type":"message","model":"test-model","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            base
+        }
+
+        // 控制组：250ms 全局 timeout 对 400ms 慢响应 → 被砍。
+        let ctrl_base = spawn_slow_json(std::time::Duration::from_millis(400)).await;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let ctrl = primed_client_with_http(&ctrl_base, http);
+        let err = ctrl
+            .chat("test-model", &ChatRequest::default(), None)
+            .await
+            .expect_err("控制组 250ms 全局 timeout 必砍 400ms 慢响应");
+        match err {
+            Error::Network(n) => assert!(n.timeout, "控制组应为 reqwest 超时错误，got: {n:?}"),
+            other => panic!("expected Network timeout, got {other:?}"),
+        }
+
+        // 默认 client：无全局总超时 → 同样的 400ms 慢响应应成功（per-request 死线 11min 远未到）。
+        let base = spawn_slow_json(std::time::Duration::from_millis(400)).await;
+        let client = primed_client(&base);
+        let out = client
+            .chat("test-model", &ChatRequest::default(), None)
+            .await
+            .expect("默认 client 无全局总超时，400ms 慢响应不应被砍");
+        assert_eq!(out.id, "msg_slow");
     }
 }
