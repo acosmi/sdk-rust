@@ -118,7 +118,7 @@ pub struct Config {
 }
 
 /// Client 可变 token 状态。
-struct ClientInner {
+pub(crate) struct ClientInner {
     // ── 不可变配置 ──
     server_url: String,
     compliance_base_url: Option<String>,
@@ -152,6 +152,14 @@ struct ClientInner {
     /// 当前 WebSocket 长连接状态句柄（对应 TS `this.ws`）。`None` = 未连接。
     /// 重复 connect 前先 disconnect 旧连接（防 ws-reconnect-leak）。
     ws: tokio::sync::Mutex<Option<crate::notifications::WsHandle>>,
+    /// P8 sanitize-bridge：请求前底线防御配置（体积 / deny-list / 深度）。`None` = 未配置
+    /// （对齐 TS `defensiveCfg == null`）。并发安全 sync 读写（不跨 await）。
+    #[cfg(feature = "sanitize")]
+    pub(crate) defensive_cfg: RwLock<Option<crate::sanitize::MinimalSanitizeConfig>>,
+    /// P8 sanitize-bridge：是否每次请求前从 `raw_messages` 剥 `acosmi_ephemeral` 标记块
+    /// （对齐 TS `autoStripEphemeral`）。
+    #[cfg(feature = "sanitize")]
+    pub(crate) auto_strip_ephemeral: AtomicBool,
 }
 
 /// 主 API 客户端。`Clone` 廉价（内部 `Arc`）。
@@ -211,8 +219,18 @@ impl Client {
                 token_ready: tokio::sync::Notify::new(),
                 coef_cache: RwLock::new(None),
                 ws: tokio::sync::Mutex::new(None),
+                #[cfg(feature = "sanitize")]
+                defensive_cfg: RwLock::new(None),
+                #[cfg(feature = "sanitize")]
+                auto_strip_ephemeral: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// crate 内访问共享内部状态（sanitize-bridge 等同 crate 子模块用）。
+    #[cfg(feature = "sanitize")]
+    pub(crate) fn inner(&self) -> &ClientInner {
+        &self.inner
     }
 
     /// 异步工厂（对应 TS `Client.create`）。从 store 预载 token；store 损坏静默忽略。
@@ -1337,7 +1355,16 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<(String, Adapter)> {
         // P8: apply_request_sanitizers —— 请求前防御（体积 / deny-list / 深度 / ephemeral 剥离）。
-        // sanitize-bridge mixin 在 P8 接通；此处仅预留调用点，本阶段不调用、零行为变化。
+        // 对齐 TS buildChatRequest 开头调用：未配置零开销 early-return；失败返 Err 放弃本次请求。
+        // sanitize 在浅拷贝上原地改写 raw_messages（不污染调用方 req）；用 Cow 避免无配置时拷贝。
+        #[cfg(feature = "sanitize")]
+        let sanitized: std::borrow::Cow<'_, ChatRequest> = {
+            let mut s = req.clone();
+            self.apply_request_sanitizers(&mut s)?;
+            std::borrow::Cow::Owned(s)
+        };
+        #[cfg(feature = "sanitize")]
+        let req: &ChatRequest = &sanitized;
 
         let m = self.ensure_model_cached(model_id, signal).await?;
         let adapter = get_adapter_for_model(&m);

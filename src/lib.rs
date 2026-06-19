@@ -45,6 +45,10 @@ pub mod models;
 pub mod notifications;
 pub mod pricing;
 pub mod products;
+/// Provider 无关的历史消息清洗子包（feature `sanitize`，默认开；对齐 npm 子路径 `./sanitize`，
+/// index.ts `export * as sanitize`）。经 [`core::sanitize_bridge`] 与 `Client` 接通。
+#[cfg(feature = "sanitize")]
+pub mod sanitize;
 pub mod shared;
 pub mod skills;
 pub mod subscription;

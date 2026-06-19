@@ -1,11 +1,13 @@
 //! 运行时基座域：主 Client、TokenStore、Retry、HTTP 辅助。
 //!
-//! 对齐 `core/index.ts`。相位说明：`sanitize_bridge`（Client × sanitize 胶水）依赖
-//! `models::ChatRequest`(P3) + `sanitize`(P8)，延到 P8 落地。
+//! 对齐 `core/index.ts`。`sanitize_bridge`（Client × sanitize 胶水）依赖
+//! `models::ChatRequest` + `sanitize`，feature `sanitize` 门控（P8 接通）。
 
 pub mod client;
 pub mod http;
 pub mod retry;
+#[cfg(feature = "sanitize")]
+pub mod sanitize_bridge;
 pub mod store;
 
 pub use client::{
