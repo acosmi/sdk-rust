@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Cargo.lock：库 crate 默认不锁（保留给二进制/示例消费方决定）。
+# 若 CI 需可重现构建，去掉下一行即可纳入版本管理。
+Cargo.lock

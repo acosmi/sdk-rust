@@ -1,0 +1,44 @@
+[package]
+name = "acosmi-sdk"
+version = "2.8.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Acosmi Rust SDK：模型网关、Agent Run Gateway 与 Compliance 统一客户端。双格式（Anthropic + OpenAI）。端口自 acosmi-sdk-ts。"
+license = "MIT"
+repository = "https://github.com/acosmi/sdk-rust"
+authors = ["Acosmi"]
+keywords = ["acosmi", "anthropic", "openai", "llm", "sdk"]
+categories = ["api-bindings", "asynchronous"]
+readme = "README.md"
+
+[lib]
+name = "acosmi"
+path = "src/lib.rs"
+
+# 跨语言契约（见 docs/开发与发布手册.md §5 与父仓 docs/jihua/sdk-rust-port-plan-2026-06-19.md）：
+#   - snake_case wire-format 字段名（serde 结构体字段即 wire 契约）
+#   - 符号名跨语言一致（类型/错误名 PascalCase；方法 snake_case 为 Rust 惯例偏移）
+#   - bug-for-bug：retry POST 默认 false / 流式不重试防双扣 / sanitize thinking 硬豁免 / 401 单次重试
+#   - 双 adapter（Anthropic + OpenAI）等地位红线，恒编译，不 feature-gate
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+tokio-util = "0.7"
+url = "2"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+# sanitize：历史消息清洗子包（对齐 npm 子路径 ./sanitize），默认开启以保证 lib 完整。
+default = ["sanitize"]
+sanitize = []
+# desktop-loopback：authorize() 的 loopback HTTP server（桌面 OAuth），按需开启。
+desktop-loopback = []
