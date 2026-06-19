@@ -35,12 +35,19 @@ mod macros;
 pub mod agent_runs;
 pub mod auth;
 pub mod billing;
+pub mod casehall;
+pub mod chatbridge;
 pub mod compliance;
 pub mod core;
+pub mod enterprise;
+pub mod finance;
 pub mod models;
 pub mod notifications;
+pub mod pricing;
+pub mod products;
 pub mod shared;
 pub mod skills;
+pub mod subscription;
 pub mod support;
 
 // 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
@@ -134,6 +141,43 @@ pub use crate::compliance::{
 };
 // === support 域逐项 re-export（对齐 support/index.ts）===
 pub use crate::support::{BugReportResult, BugView};
+// === subscription 域逐项 re-export（对齐 subscription/index.ts）===
+pub use crate::subscription::{
+    Membership, RolloverPolicy, SubscriptionAudience, SubscriptionPlan, SubscriptionPrecheckResult,
+    SubscriptionTier, UserSubscription,
+};
+// === pricing 域逐项 re-export（对齐 pricing/index.ts）===
+pub use crate::pricing::{
+    ComplianceBenefitType, ComplianceQuoteResponse, ComplianceSku, PricingConfig,
+    PublicModelSummary,
+};
+// === products 域逐项 re-export（对齐 products/index.ts）===
+pub use crate::products::{Audience, BillingMode, Product, ProductFamily, RegionScope};
+// === casehall 域逐项 re-export（对齐 casehall/index.ts）===
+pub use crate::casehall::{
+    BookConsultationRequest, BookConsultationResult, CaseLead, CaseLeadIdResult, CaseMatter,
+    LawyerCredentialMyView, LawyerSummary, LegalBenefitType, LegalConsultation, LegalServiceOrder,
+    LegalServiceSku, LegalSkuCode, ListLawyersParams, SubmitCaseLeadRequest,
+};
+// === enterprise 域逐项 re-export（对齐 enterprise/index.ts）===
+pub use crate::enterprise::{
+    AssignSeatRequest, EnterpriseKycMyStatusView, EnterpriseMember, EnterpriseSummary,
+    InviteMemberRequest, MemberRole, OrgConsumeReport, OrgSeat, OrgSubscription,
+};
+// === finance 域逐项 re-export（对齐 finance/index.ts；所有 *Fen = i64 整数分 §3）===
+pub use crate::finance::{
+    CorporateTransfer, InitiateCorporateTransferInput, InitiateCorporateTransferResult, Invoice,
+    InvoiceType, RefundPolicy, RefundProductFamily, RefundRecord, RequestInvoiceInput,
+    RequestRefundInput,
+};
+// === chatbridge 域逐项 re-export（对齐 chatbridge/index.ts；secret 零导出 §安全红线）===
+pub use crate::chatbridge::{
+    as_credential_ref, is_channel_inbound_event, is_integration_status, is_platform, is_region,
+    BridgeThreadRef, ChannelAttachment, ChannelCard, ChannelCardAction, ChannelInboundEvent,
+    ChannelOutboundEvent, ChatBridgeClient, ChatBridgeSession, ChatCredentialPublic,
+    ChatIntegration, ChatThread, CreateIntegrationRequest, CredentialRef, IntegrationStatus,
+    Platform, Region, StoreCredentialRequest, ALL_INTEGRATION_STATUS, ALL_PLATFORMS, ALL_REGIONS,
+};
 pub use shared::{Error, Result};
 
 #[cfg(test)]
