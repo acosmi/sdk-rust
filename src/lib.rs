@@ -37,6 +37,18 @@ pub mod core;
 pub mod shared;
 
 // 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
+pub use crate::auth::{
+    all_scopes, chat_bridge_scopes, code_challenge, commerce_scopes,
+    complete_web_authorization_request, create_web_authorization_request, discover,
+    discover_web_oauth_metadata, discover_with_profile, exchange_code, exchange_code_with_expiry,
+    generate_code_verifier, generate_state, is_invalid_grant_error, is_ssl_error,
+    is_valid_token_set, model_scopes, new_token_set, refresh_token, register,
+    register_web_oauth_client, remote_control_scopes, resolve_success_redirect, revoke_token,
+    skill_scopes, token_set_is_expired, AuthorizeResult, ClientRegistration,
+    CreateWebAuthorizationRequestOptions, LoginEvent, LoginOptions, OAuthTokenEndpointError,
+    RegisterWebOAuthClientOptions, ServerMetadata, TokenResponse, TokenSet,
+    WebAuthorizationCallbackParams, WebAuthorizationPending, WebAuthorizationRequest,
+};
 pub use crate::core::{
     Client, Config, FileTokenStore, InMemoryTokenStore, TokenStore, DEFAULT_GATEWAY_BASE_URL,
 };

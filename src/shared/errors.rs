@@ -190,6 +190,11 @@ pub enum Error {
     #[error(transparent)]
     Stream(#[from] StreamError),
 
+    /// OAuth token 端点（exchange / refresh）结构化错误。对应 TS `OAuthTokenEndpointError`。
+    /// 携带 OAuth `error` 码用于 `is_invalid_grant_error` 判定。
+    #[error(transparent)]
+    OAuthTokenEndpoint(#[from] crate::auth::auth::OAuthTokenEndpointError),
+
     // ── Rust 传播用工具变体（TS 无对应；用于 `?` 链路）──
     #[error(transparent)]
     Json(#[from] serde_json::Error),
