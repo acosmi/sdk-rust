@@ -21,6 +21,11 @@ pub const MAX_ERROR_BODY_SIZE: usize = 1024 * 1024;
 pub const MAX_SSE_LINE_SIZE: usize = 1024 * 1024;
 /// 模型列表缓存有效期（毫秒）。
 pub const MODEL_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+/// 非流式 JSON 子请求默认超时（毫秒），对应 TS `doJSONFull*` 内 `withRequestTimeout(30_000,...)`。
+pub const DEFAULT_JSON_TIMEOUT_MS: u64 = 30_000;
+/// chat / messages / 媒体生成 per-request 超时（毫秒，11min），对应 TS `CHAT_REQUEST_TIMEOUT_MS`。
+/// 容纳 DeepSeek 等上游"首字节前 10min 保活"窗口。
+pub const CHAT_REQUEST_TIMEOUT_MS: u64 = 11 * 60 * 1000;
 /// V29 系数缓存（TTL 8s）。
 pub const COEF_CACHE_TTL_MS: u64 = 8 * 1000;
 

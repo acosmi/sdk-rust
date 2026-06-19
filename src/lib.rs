@@ -51,7 +51,7 @@ pub use crate::auth::{
     WebAuthorizationCallbackParams, WebAuthorizationPending, WebAuthorizationRequest,
 };
 pub use crate::core::{
-    Client, Config, FileTokenStore, FilterStatus, InMemoryTokenStore, TokenStore,
+    ChatUsageEvent, Client, Config, FileTokenStore, FilterStatus, InMemoryTokenStore, TokenStore,
     DEFAULT_GATEWAY_BASE_URL,
 };
 // === models 域逐项 re-export（对齐 models/index.ts）===

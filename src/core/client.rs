@@ -12,17 +12,30 @@
 use crate::auth::auth as oauth;
 use crate::auth::types::{token_set_is_expired, ServerMetadata, TokenSet};
 use crate::core::http::{
-    parse_http_error_with_retry_after, read_limited_text, MAX_ERROR_BODY_SIZE, MODEL_CACHE_TTL_MS,
+    classify_transport, iter_sse_lines, parse_http_error_with_retry_after, parse_stream_error,
+    read_limited_text, CHAT_REQUEST_TIMEOUT_MS, DEFAULT_JSON_TIMEOUT_MS, MAX_ERROR_BODY_SIZE,
+    MODEL_CACHE_TTL_MS,
 };
-use crate::core::retry::{effective_policy, EffectiveRetryPolicy, RetryPolicy};
+use crate::core::retry::{effective_policy, EffectiveRetryPolicy, RetryPolicy, RetryRequestInfo};
 use crate::core::store::{FileTokenStore, InMemoryTokenStore, TokenStore};
 use crate::macros::open_string_union;
+use crate::models::adapters::openai::parse_openai_response_to_anthropic;
+use crate::models::adapters::{get_adapter_for_model, Adapter, ProviderFormat};
+use crate::models::is_sse_comment_line;
+use crate::models::stream_meta::{extract_anthropic_block_meta, BlockMeta};
 use crate::models::types::{
-    zero_model_capabilities, InputModality, ManagedModel, ModelCapabilities, QuotaSummary,
+    parse_settlement, parse_sources_event, zero_model_capabilities, ChatRequest, ChatResponse,
+    ImageGenerationRequest, ImageGenerationResponse, InputModality, ManagedModel,
+    ModelCapabilities, QuotaSummary, SourcesEvent, StreamEvent, StreamSettlement,
+    VideoGenerationRequest, VideoTaskResponse,
 };
+use crate::models::wire_anthropic::AnthropicResponse;
 use crate::shared::api_response::ApiResponse;
 use crate::shared::errors::{Error, Result};
+use futures::Stream;
+use futures::StreamExt;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -113,12 +126,10 @@ struct ClientInner {
     oauth_metadata_profile: OAuthMetadataProfile,
     browser_refresh_mode: BrowserRefreshMode,
     refresh_proxy_url: Option<String>,
-    /// 共享 HTTP client。P4（chat/请求层）起使用。
-    #[allow(dead_code)]
+    /// 共享 HTTP client。
     http: reqwest::Client,
     store: Arc<dyn TokenStore>,
-    /// 生效重试策略。P4（请求层）起使用。
-    #[allow(dead_code)]
+    /// 生效重试策略。
     retry_policy: Option<EffectiveRetryPolicy>,
 
     // ── 可变状态 ──
@@ -252,14 +263,12 @@ impl Client {
         self.inner.refresh_proxy_url.as_deref()
     }
 
-    /// 共享 HTTP client（内部 / 业务方法使用）。P4 起使用。
-    #[allow(dead_code)]
+    /// 共享 HTTP client（内部 / 业务方法使用）。
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.inner.http
     }
 
-    /// 生效重试策略（`None` = 禁用）。P4 起使用。
-    #[allow(dead_code)]
+    /// 生效重试策略（`None` = 禁用）。
     pub(crate) fn retry_policy(&self) -> Option<&EffectiveRetryPolicy> {
         self.inner.retry_policy.as_ref()
     }
@@ -995,6 +1004,970 @@ impl Client {
         }
         None
     }
+
+    /// 从缓存查找完整 [`ManagedModel`]（未命中返 `None`）。对应 TS `getCachedModel`。
+    fn cached_model(&self, model_id: &str) -> Option<ManagedModel> {
+        let cache = self.inner.model_cache.read().unwrap();
+        cache
+            .iter()
+            .find(|m| m.id == model_id || m.model_id == model_id)
+            .cloned()
+    }
+
+    /// 确保指定 `model_id` 的 [`ManagedModel`] 已在缓存中。对应 TS `ensureModelCached`。
+    ///
+    /// 1. 缓存命中 → 直接返回；
+    /// 2. 未命中 → 调 `list_models` 刷新一次；
+    /// 3. 刷新后仍未命中 → `Error::ModelNotFound`。
+    ///
+    /// 根因修复（对齐 TS）：消除未预热场景下 `provider="anthropic"` 硬编码回退，
+    /// 该回退会让 non-anthropic 模型被按 Anthropic 格式编码并打到错误端点。
+    pub async fn ensure_model_cached(
+        &self,
+        model_id: &str,
+        signal: Option<CancellationToken>,
+    ) -> Result<ManagedModel> {
+        if let Some(m) = self.cached_model(model_id) {
+            return Ok(m);
+        }
+        self.list_models(signal, false).await?;
+        if let Some(m) = self.cached_model(model_id) {
+            return Ok(m);
+        }
+        Err(Error::ModelNotFound {
+            model_id: model_id.to_string(),
+        })
+    }
+
+    // ===========================================================================
+    // 请求层（do_request / do_request_with_retry / do_json_full_raw）
+    //
+    // 红线区分：
+    //   - do_request           = 单次 HTTP，**绝不重试**（流式路径独占）。
+    //   - do_request_with_retry = 经 retry_policy + safe_to_retry 闸门的非流式包装
+    //                             （POST 默认 safe_to_retry=false，不重试，计费安全）。
+    //   - 401 单次 force_refresh 重试由 do_json_full_raw / 流式 gen 各自的 `retried` guard 管。
+    // ===========================================================================
+
+    /// 单次 HTTP 请求（**无重试**）。对应 TS `doRequest`。
+    ///
+    /// 传输层错误经 [`classify_transport`] 转 [`Error::Network`]（便于 retry policy 判定）。
+    /// 取消信号经 `select!` 接入。**流式路径必须直接走此函数**，绝不经 [`Self::do_request_with_retry`]。
+    async fn do_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: &[(reqwest::header::HeaderName, String)],
+        body: Option<&str>,
+        signal: Option<&CancellationToken>,
+    ) -> Result<reqwest::Response> {
+        let mut rb = self.http().request(method.clone(), url);
+        for (k, v) in headers {
+            rb = rb.header(k.clone(), v.clone());
+        }
+        if let Some(b) = body {
+            rb = rb.body(b.to_string());
+        }
+        let send = rb.send();
+        let resp = match signal {
+            Some(cancel) => tokio::select! {
+                r = send => r,
+                _ = cancel.cancelled() => {
+                    return Err(Error::Network(crate::shared::errors::NetworkError::new(
+                        format!("{method} {url}"),
+                        url,
+                        "request aborted",
+                    )));
+                }
+            },
+            None => send.await,
+        };
+        resp.map_err(|e| {
+            let path = Url::parse(url)
+                .map(|u| u.path().to_string())
+                .unwrap_or_else(|_| url.to_string());
+            Error::Network(classify_transport(&format!("{method} {path}"), url, &e))
+        })
+    }
+
+    /// 带 RetryPolicy 的 [`Self::do_request`] 包装 —— **仅用于非流式路径**。对应 TS `doRequestWithRetry`。
+    ///
+    /// 闸门：`retry_policy` 缺省（`None`）或 `safe_to_retry` 判定不可重试（POST 默认 false）→
+    /// 直接走单次 [`Self::do_request`]。仅 5xx/429 进入 retry 评估（构造 [`Error::Http`] 喂
+    /// `on_retryable`）；transport 层错误（[`Error::Network`]）也喂 `on_retryable`。
+    ///
+    /// **流式路径（[`Self::chat_stream`] / [`Self::chat_messages_stream`]）绝不调用此函数**，
+    /// 必须直接用 [`Self::do_request`]（重试 = 双 token + 重复消息 = 双扣，计费安全红线）。
+    async fn do_request_with_retry(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: &[(reqwest::header::HeaderName, String)],
+        body: Option<&str>,
+        signal: Option<&CancellationToken>,
+    ) -> Result<reqwest::Response> {
+        let policy = match self.retry_policy() {
+            Some(p) => p.clone(),
+            None => return self.do_request(method, url, headers, body, signal).await,
+        };
+        let info = RetryRequestInfo {
+            method: method.as_str().to_string(),
+            url: url.to_string(),
+        };
+        if !(policy.safe_to_retry)(&info) {
+            return self.do_request(method, url, headers, body, signal).await;
+        }
+
+        let mut last_err: Option<Error> = None;
+        let mut attempt: u32 = 0;
+        while attempt < policy.max_attempts {
+            match self
+                .do_request(method.clone(), url, headers, body, signal)
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    // 仅 5xx/429 进入 retry 评估，其余直接返回。
+                    if status < 500 && status != 429 {
+                        return Ok(resp);
+                    }
+                    let retry_after = parse_retry_after_secs(resp.headers());
+                    let peek = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+                    last_err = Some(Error::Http(parse_http_error_with_retry_after(
+                        status,
+                        &peek,
+                        retry_after,
+                    )));
+                }
+                Err(e) => last_err = Some(e),
+            }
+
+            if attempt + 1 == policy.max_attempts {
+                break;
+            }
+            let err_ref = last_err.as_ref().expect("last_err set");
+            if !(policy.on_retryable)(err_ref) {
+                break;
+            }
+            let backoff = crate::core::retry::compute_backoff(&policy, attempt, err_ref);
+            sleep_with_cancel(backoff, signal).await;
+            attempt += 1;
+        }
+        Err(last_err.unwrap_or_else(|| Error::other("do_request_with_retry: no attempts ran")))
+    }
+
+    /// POST/GET JSON 请求，返回 **raw bytes** + 响应头（chat / 媒体用，不立即反序列化）。
+    /// 对应 TS `doJSONFullRaw`。
+    ///
+    /// 行为：ensure_token → Bearer → [`Self::do_request_with_retry`]（POST 默认不重试）→
+    /// 401 单次 force_refresh 重试（`retried` guard 防递归）→ 非 2xx 抛 [`Error::Http`]（含 Retry-After）→
+    /// 读 body bytes。
+    async fn do_json_full_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&str>,
+        signal: Option<CancellationToken>,
+        timeout_ms: u64,
+    ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
+        // per-request 超时（对应 TS withRequestTimeout）：派生子 token，超时或 parent 取消任一触发即 abort。
+        let ctl = self.derive_timeout_token(timeout_ms, signal);
+        self.do_json_full_raw_internal(method, path, body, ctl.as_ref(), false)
+            .await
+    }
+
+    async fn do_json_full_raw_internal(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&str>,
+        signal: Option<&CancellationToken>,
+        retried: bool,
+    ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
+        let token = self.ensure_token(signal.cloned()).await?;
+        let url = self.api_url(path);
+
+        let mut headers: Vec<(reqwest::header::HeaderName, String)> =
+            vec![(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))];
+        if body.is_some() {
+            headers.push((
+                reqwest::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            ));
+        }
+
+        let resp = self
+            .do_request_with_retry(method.clone(), &url, &headers, body, signal)
+            .await?;
+
+        // 401：单次 force_refresh 重试（防递归）。
+        if resp.status().as_u16() == 401 && !retried {
+            drop(resp); // 释放连接（对应 TS resp.body?.cancel()）。
+            self.force_refresh(signal.cloned())
+                .await
+                .map_err(|e| Error::other(format!("unauthorized and refresh failed: {e}")))?;
+            return Box::pin(self.do_json_full_raw_internal(method, path, body, signal, true))
+                .await;
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let retry_after = parse_retry_after_secs(resp.headers());
+            let text = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+            return Err(Error::Http(parse_http_error_with_retry_after(
+                status,
+                &text,
+                retry_after,
+            )));
+        }
+
+        let headers = resp.headers().clone();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::other(format!("{method} {path}: read body: {e}")))?;
+        Ok((bytes.to_vec(), headers))
+    }
+
+    /// POST/GET JSON + ApiResponse 解包（业务码检查）+ **空体契约**（方案 §4.4）。对应 TS `doJSONFull<T>`。
+    ///
+    /// 空 body：返回 `Ok((None, headers))`（调用方据返回类型决定是否容忍）；
+    /// 非空 body：反序列化 `T`，若 `T` 含 `code` 字段且 `code != 0` 抛 BusinessError。
+    /// 这里返回 `Option<T>`，让调用方对空体显式处理（与 GET-only `do_json_get_full` 的强 Err 互补）。
+    #[allow(dead_code)]
+    async fn do_json_full<T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&str>,
+        signal: Option<CancellationToken>,
+    ) -> Result<(Option<T>, reqwest::header::HeaderMap)> {
+        let (bytes, headers) = self
+            .do_json_full_raw(method, path, body, signal, DEFAULT_JSON_TIMEOUT_MS)
+            .await?;
+        if bytes.is_empty() {
+            // 空 body 成功响应：跳业务码检查，返回 None（对应 TS `undefined as T`）。
+            return Ok((None, headers));
+        }
+        let result: T = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::other(format!("{path}: decode: {e}")))?;
+        Ok((Some(result), headers))
+    }
+
+    // ===========================================================================
+    // Chat
+    // ===========================================================================
+
+    /// 构建完整聊天请求体（v0.5.0 adapter 模式）。对应 TS `buildChatRequest`。
+    ///
+    /// `ensure_model_cached` → `get_adapter_for_model` → adapter `build_request_body`。
+    /// 返回 `(JSON body 字符串, adapter)`。
+    pub async fn build_chat_request(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<(String, Adapter)> {
+        // P8: apply_request_sanitizers —— 请求前防御（体积 / deny-list / 深度 / ephemeral 剥离）。
+        // sanitize-bridge mixin 在 P8 接通；此处仅预留调用点，本阶段不调用、零行为变化。
+
+        let m = self.ensure_model_cached(model_id, signal).await?;
+        let adapter = get_adapter_for_model(&m);
+        let caps = self
+            .cached_capabilities(model_id)
+            .unwrap_or_else(zero_model_capabilities);
+        let body_map = adapter.build_request_body(&caps, req);
+        let body = serde_json::to_string(&body_map)
+            .map_err(|e| Error::other(format!("serialize chat request: {e}")))?;
+        Ok((body, adapter))
+    }
+
+    /// 同步聊天（适合短回复）。对应 TS `chat`。
+    ///
+    /// 响应的 `token_remaining` / `call_remaining` / `model_token_remaining*` 来自服务端响应头
+    /// （反映结算后余额）；缺失保持 [`ChatResponse`] 默认哨兵。v0.5.0 按 provider 路由
+    /// `/anthropic` 或 `/chat`。
+    pub async fn chat(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<ChatResponse> {
+        // 浅拷贝 + 强制 stream=false（避免原地 mutate 调用方 req）。
+        let mut r = req.clone();
+        r.stream = Some(false);
+
+        let (body, adapter) = self
+            .build_chat_request(model_id, &r, signal.clone())
+            .await?;
+        let endpoint = format!(
+            "/managed-models/{}{}",
+            urlencode(model_id),
+            adapter.endpoint_suffix()
+        );
+        let (bytes, headers) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&body),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+
+        let mut resp = adapter.parse_response(&bytes)?;
+
+        // 从响应头提取 token / call 余额（解析失败保持默认哨兵）。
+        if let Some(v) = header_i64(&headers, "X-Token-Remaining") {
+            resp.token_remaining = v;
+        }
+        if let Some(v) = header_i64(&headers, "X-Call-Remaining") {
+            resp.call_remaining = v;
+        }
+        if let Some(v) = header_i64(&headers, "X-Token-Remaining-Model") {
+            resp.model_token_remaining = v;
+        }
+        if let Some(v) = header_i64(&headers, "X-Token-Remaining-Model-ETU") {
+            resp.model_token_remaining_etu = v;
+        }
+        Ok(resp)
+    }
+
+    // ===========================================================================
+    // 媒体生成（v1.3+）—— 图片 / 视频生成托管模型（与 chat 同网关）
+    // ===========================================================================
+
+    /// 解析 nexus-v4 `{code,message,data}` 信封，`code!=0` 抛 BusinessError，返回 `data`。
+    /// 对应 TS `unwrapAPIResponse`。
+    fn unwrap_api_response<T: DeserializeOwned>(path: &str, bytes: &[u8]) -> Result<T> {
+        let env: ApiResponse<T> = serde_json::from_slice(bytes)
+            .map_err(|e| Error::other(format!("{path}: decode: {e}")))?;
+        if let Some(err) = env.business_error() {
+            return Err(err);
+        }
+        Ok(env.data)
+    }
+
+    /// 图片生成（同步）。`POST /managed-models/:id/images/generations`。对应 TS `generateImage`。
+    ///
+    /// `model_id` 须为图片生成托管模型（`capabilities.supports_image_generation=true`）。
+    /// 图片生成耗时常超 30s，用 chat 同级超时（11min）容纳上游。
+    pub async fn generate_image(
+        &self,
+        model_id: &str,
+        req: &ImageGenerationRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<ImageGenerationResponse> {
+        let endpoint = format!("/managed-models/{}/images/generations", urlencode(model_id));
+        let body = serde_json::to_string(req)
+            .map_err(|e| Error::other(format!("serialize image request: {e}")))?;
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&body),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+        Self::unwrap_api_response(&endpoint, &bytes)
+    }
+
+    /// 创建视频生成任务（异步）。`POST /managed-models/:id/videos/generations`。对应 TS `generateVideo`。
+    ///
+    /// 返回 `task_id`；用 [`Self::poll_video_task`] 轮询直到 `status=completed`。
+    /// 上报真物理量（视频秒数）需在 `poll_video_task` 时回传 `duration`。
+    pub async fn generate_video(
+        &self,
+        model_id: &str,
+        req: &VideoGenerationRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<VideoTaskResponse> {
+        let endpoint = format!("/managed-models/{}/videos/generations", urlencode(model_id));
+        let body = serde_json::to_string(req)
+            .map_err(|e| Error::other(format!("serialize video request: {e}")))?;
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&body),
+                signal,
+                DEFAULT_JSON_TIMEOUT_MS,
+            )
+            .await?;
+        Self::unwrap_api_response(&endpoint, &bytes)
+    }
+
+    /// 轮询视频任务状态。`GET /managed-models/:id/videos/tasks/:taskId`。对应 TS `pollVideoTask`。
+    ///
+    /// `duration_seconds`（创建时的时长，秒）透传给网关在 completed 时上报用量。
+    pub async fn poll_video_task(
+        &self,
+        model_id: &str,
+        task_id: &str,
+        duration_seconds: Option<i64>,
+        signal: Option<CancellationToken>,
+    ) -> Result<VideoTaskResponse> {
+        let mut endpoint = format!(
+            "/managed-models/{}/videos/tasks/{}",
+            urlencode(model_id),
+            urlencode(task_id)
+        );
+        if let Some(d) = duration_seconds.filter(|&d| d > 0) {
+            endpoint.push_str(&format!("?duration={d}"));
+        }
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::GET,
+                &endpoint,
+                None,
+                signal,
+                DEFAULT_JSON_TIMEOUT_MS,
+            )
+            .await?;
+        Self::unwrap_api_response(&endpoint, &bytes)
+    }
+
+    // ===========================================================================
+    // Anthropic 原生格式同步聊天（chat_messages*）
+    // ===========================================================================
+
+    /// Anthropic 原生格式同步聊天。对应 TS `chatMessages`。
+    ///
+    /// v0.5.0 按 provider 路由：Anthropic → `chat_messages_anthropic`（POST /anthropic）；
+    /// 其他厂商 → `chat_messages_openai`（POST /chat，响应转换为 [`AnthropicResponse`]）。
+    pub async fn chat_messages(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<AnthropicResponse> {
+        let m = self.ensure_model_cached(model_id, signal.clone()).await?;
+        let adapter = get_adapter_for_model(&m);
+        if adapter.format() == ProviderFormat::Anthropic {
+            self.chat_messages_anthropic(model_id, req, adapter, signal)
+                .await
+        } else {
+            self.chat_messages_openai(model_id, req, adapter, signal)
+                .await
+        }
+    }
+
+    async fn chat_messages_anthropic(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        adapter: Adapter,
+        signal: Option<CancellationToken>,
+    ) -> Result<AnthropicResponse> {
+        let mut r = req.clone();
+        r.stream = Some(false);
+        let caps = self
+            .cached_capabilities(model_id)
+            .unwrap_or_else(zero_model_capabilities);
+        let body_map = adapter.build_request_body(&caps, &r);
+        let data = serde_json::to_string(&body_map)
+            .map_err(|e| Error::other(format!("serialize messages request: {e}")))?;
+
+        let endpoint = format!("/managed-models/{}/anthropic", urlencode(model_id));
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&data),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+
+        // 尝试 APIResponse 包装 {"code":0,"message":"...","data":{...}}；data 缺失则 fall through
+        // 直接当 AnthropicResponse 解（对齐 TS chatMessagesAnthropic 的 lenient 逻辑）。
+        if let Ok(wrapper) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(data_val) = wrapper.get("data").filter(|v| !v.is_null()) {
+                let code = wrapper.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+                if code != 0 {
+                    let msg = wrapper
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    return Err(Error::business(code, msg));
+                }
+                return serde_json::from_value(data_val.clone()).map_err(|e| {
+                    Error::other(format!("decode anthropic response (wrapped): {e}"))
+                });
+            }
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Error::other(format!("decode anthropic response: {e}")))
+    }
+
+    async fn chat_messages_openai(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        adapter: Adapter,
+        signal: Option<CancellationToken>,
+    ) -> Result<AnthropicResponse> {
+        let mut r = req.clone();
+        r.stream = Some(false);
+        let caps = self
+            .cached_capabilities(model_id)
+            .unwrap_or_else(zero_model_capabilities);
+        let body_map = adapter.build_request_body(&caps, &r);
+        let data = serde_json::to_string(&body_map)
+            .map_err(|e| Error::other(format!("serialize messages request: {e}")))?;
+
+        let endpoint = format!(
+            "/managed-models/{}{}",
+            urlencode(model_id),
+            adapter.endpoint_suffix()
+        );
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&data),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+        // OpenAI 格式响应 → AnthropicResponse 转换（对齐 TS）。
+        parse_openai_response_to_anthropic(&bytes)
+    }
+
+    // ===========================================================================
+    // 流式聊天（SSE）—— 计费安全红线：只 do_request，绝不重试
+    // ===========================================================================
+
+    /// 流式聊天（SSE），返回 `impl Stream<Item = Result<StreamEvent>>`。对应 TS `chatStream`。
+    ///
+    /// **🔴 计费安全红线**：流式路径**只走单次 [`Self::do_request`]，绝不经 retry 包装**——
+    /// SSE 一旦部分写出，重试 = 双 token + 重复消息 = 双扣。401 仅做一次 force_refresh 重试
+    /// （`retried` guard 防递归）。`signal` 经 `select!` 接入 SSE 读循环。
+    pub fn chat_stream(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+    ) -> impl Stream<Item = Result<StreamEvent>> {
+        let this = self.clone();
+        let model_id = model_id.to_string();
+        let req = req.clone();
+        async_stream::try_stream! {
+            let inner = this.chat_stream_gen(&model_id, &req, signal, false);
+            futures::pin_mut!(inner);
+            while let Some(ev) = inner.next().await {
+                yield ev?;
+            }
+        }
+    }
+
+    /// 流式聊天 + 自动解析结算 / 搜索来源事件。对应 TS `chatStreamWithUsage`。
+    ///
+    /// tagged 流：`Settle`（结算）/ `Sources`（搜索来源）/ `Content`（内容增量）。
+    /// `started` 控制事件被过滤；`failed`/`error` 事件经 [`parse_stream_error`] 转 [`Error::Stream`]。
+    pub fn chat_stream_with_usage(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+    ) -> impl Stream<Item = Result<ChatUsageEvent>> {
+        let this = self.clone();
+        let model_id = model_id.to_string();
+        let req = req.clone();
+        async_stream::try_stream! {
+            let inner = this.chat_stream(&model_id, &req, signal);
+            futures::pin_mut!(inner);
+            while let Some(ev) = inner.next().await {
+                let ev = ev?;
+                // 结算事件（settled / pending_settle）。
+                if let Some(s) = parse_settlement(&ev) {
+                    yield ChatUsageEvent::Settle(s);
+                    continue;
+                }
+                // 搜索来源事件。
+                if let Some(src) = parse_sources_event(&ev) {
+                    yield ChatUsageEvent::Sources(src);
+                    continue;
+                }
+                // 控制事件：过滤。
+                if ev.event == "started" {
+                    continue;
+                }
+                // 失败 / 错误事件：解析后抛出。
+                if ev.event == "failed" || ev.event == "error" {
+                    Err(Error::Stream(parse_stream_error(&ev.data)))?;
+                }
+                yield ChatUsageEvent::Content(ev);
+            }
+        }
+    }
+
+    /// Anthropic 原生格式流式聊天（SSE）。对应 TS `chatMessagesStream`。
+    ///
+    /// 调用 POST `/managed-models/:id/anthropic`（Anthropic 路由）或 `/chat`（OpenAI 路由，
+    /// 经 `OpenAIStreamConverter` 转 Anthropic 兼容事件）。同样**只走 do_request，绝不重试**。
+    pub fn chat_messages_stream(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+    ) -> impl Stream<Item = Result<StreamEvent>> {
+        let this = self.clone();
+        let model_id = model_id.to_string();
+        let req = req.clone();
+        async_stream::try_stream! {
+            let inner = this.chat_messages_stream_gen(&model_id, &req, signal, false);
+            futures::pin_mut!(inner);
+            while let Some(ev) = inner.next().await {
+                yield ev?;
+            }
+        }
+    }
+
+    /// chat_stream 的真实实现（含 401 单次重试递归）。返回 `impl Stream`。
+    ///
+    /// 🔴 **只调用 [`Self::do_request`]（单次，无重试）**。401 且未重试过 → force_refresh →
+    /// 递归一次（`retried=true`，防再次 401 递归）。
+    fn chat_stream_gen<'a>(
+        &'a self,
+        model_id: &'a str,
+        req: &'a ChatRequest,
+        signal: Option<CancellationToken>,
+        retried: bool,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'a>> {
+        Box::pin(async_stream::try_stream! {
+            let mut r = req.clone();
+            r.stream = Some(true);
+            let (body, adapter) = self.build_chat_request(model_id, &r, signal.clone()).await?;
+            let token = self.ensure_token(signal.clone()).await?;
+
+            let endpoint = format!(
+                "/managed-models/{}{}",
+                urlencode(model_id),
+                adapter.endpoint_suffix()
+            );
+            let url = self.api_url(&endpoint);
+            let headers = stream_headers(&token);
+
+            // 🔴 红线：流式只走 do_request（单次），绝不 do_request_with_retry。
+            let resp = self
+                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref())
+                .await?;
+
+            // 401 单次重试：force_refresh 后递归一次（retried guard 防递归）。
+            if resp.status().as_u16() == 401 && !retried {
+                drop(resp);
+                self.force_refresh(signal.clone()).await.map_err(|e| {
+                    Error::other(format!("stream: unauthorized and refresh failed: {e}"))
+                })?;
+                let inner = self.chat_stream_gen(model_id, req, signal, true);
+                futures::pin_mut!(inner);
+                while let Some(ev) = inner.next().await {
+                    yield ev?;
+                }
+                return;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let retry_after = parse_retry_after_secs(resp.headers());
+                let text = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+                Err(Error::Http(parse_http_error_with_retry_after(status, &text, retry_after)))?;
+                return;
+            }
+
+            // Anthropic 路由：维护 block 元数据 map；OpenAI 路由：parse_stream_line 自处理。
+            let mut block_type_map: Option<HashMap<i64, BlockMeta>> =
+                if adapter.format() == ProviderFormat::Anthropic {
+                    Some(HashMap::new())
+                } else {
+                    None
+                };
+
+            let lines = iter_sse_lines(resp.bytes_stream());
+            futures::pin_mut!(lines);
+            let mut current_event = String::new();
+            loop {
+                // 取消信号接入 SSE 读循环。cancel 触发 → 注入 abort 错误项。
+                let next: Option<Result<String>> = match &signal {
+                    Some(cancel) => tokio::select! {
+                        l = lines.next() => l,
+                        _ = cancel.cancelled() => Some(Err(Error::other("stream: aborted"))),
+                    },
+                    None => lines.next().await,
+                };
+                let line = match next {
+                    Some(l) => l?,
+                    None => break,
+                };
+                // 跳过 SSE 注释行（": keep-alive"）与空行。
+                if is_sse_comment_line(&line) || line.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("event:") {
+                    current_event = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    let data = rest.trim();
+                    let (mut ev, done) = adapter.parse_stream_line(&current_event, data)?;
+                    if done {
+                        return;
+                    }
+                    if let Some(map) = block_type_map.as_mut() {
+                        let (idx, bt, eph) =
+                            extract_anthropic_block_meta(&current_event, data, map);
+                        if !bt.is_empty() {
+                            ev.block_index = Some(idx);
+                            ev.block_type = Some(bt);
+                            ev.ephemeral = Some(eph);
+                        }
+                    }
+                    yield ev;
+                }
+            }
+        })
+    }
+
+    /// chat_messages_stream 的真实实现（含 401 单次重试递归）。
+    ///
+    /// 🔴 同 [`Self::chat_stream_gen`]：只走 do_request，绝不重试。OpenAI 路由经
+    /// `OpenAIStreamConverter` 转 Anthropic 兼容事件；Anthropic 路由原生事件直透 + block 元数据回填。
+    fn chat_messages_stream_gen<'a>(
+        &'a self,
+        model_id: &'a str,
+        req: &'a ChatRequest,
+        signal: Option<CancellationToken>,
+        retried: bool,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'a>> {
+        Box::pin(async_stream::try_stream! {
+            let mut r = req.clone();
+            r.stream = Some(true);
+            let (body, adapter) = self.build_chat_request(model_id, &r, signal.clone()).await?;
+            let token = self.ensure_token(signal.clone()).await?;
+
+            let endpoint = format!(
+                "/managed-models/{}{}",
+                urlencode(model_id),
+                adapter.endpoint_suffix()
+            );
+            let url = self.api_url(&endpoint);
+            let headers = stream_headers(&token);
+
+            // 🔴 红线：流式只走 do_request（单次），绝不重试。
+            let resp = self
+                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref())
+                .await?;
+
+            if resp.status().as_u16() == 401 && !retried {
+                drop(resp);
+                self.force_refresh(signal.clone()).await.map_err(|e| {
+                    Error::other(format!("messages stream: unauthorized and refresh failed: {e}"))
+                })?;
+                let inner = self.chat_messages_stream_gen(model_id, req, signal, true);
+                futures::pin_mut!(inner);
+                while let Some(ev) = inner.next().await {
+                    yield ev?;
+                }
+                return;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let retry_after = parse_retry_after_secs(resp.headers());
+                let text = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+                Err(Error::Http(parse_http_error_with_retry_after(status, &text, retry_after)))?;
+                return;
+            }
+
+            let is_openai = adapter.format() == ProviderFormat::OpenAI;
+            let mut converter = if is_openai {
+                Some(crate::models::new_openai_stream_converter())
+            } else {
+                None
+            };
+            let mut block_type_map: HashMap<i64, BlockMeta> = HashMap::new();
+
+            let lines = iter_sse_lines(resp.bytes_stream());
+            futures::pin_mut!(lines);
+            let mut current_event = String::new();
+            loop {
+                let next: Option<Result<String>> = match &signal {
+                    Some(cancel) => tokio::select! {
+                        l = lines.next() => l,
+                        _ = cancel.cancelled() => Some(Err(Error::other("messages stream: aborted"))),
+                    },
+                    None => lines.next().await,
+                };
+                let line = match next {
+                    Some(l) => l?,
+                    None => break,
+                };
+                if is_sse_comment_line(&line) || line.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("event:") {
+                    current_event = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    let data = rest.trim();
+                    if let Some(conv) = converter.as_mut() {
+                        // OpenAI SSE → Anthropic 兼容事件。
+                        let (events, done) = conv.convert(data)?;
+                        for ev in events {
+                            yield ev;
+                        }
+                        if done {
+                            return;
+                        }
+                    } else {
+                        // Anthropic SSE：原生事件直透 + content block 元数据回填。
+                        let mut ev = StreamEvent {
+                            event: current_event.clone(),
+                            data: data.to_string(),
+                            ..Default::default()
+                        };
+                        let (idx, bt, eph) =
+                            extract_anthropic_block_meta(&current_event, data, &mut block_type_map);
+                        if !bt.is_empty() {
+                            ev.block_index = Some(idx);
+                            ev.block_type = Some(bt);
+                            ev.ephemeral = Some(eph);
+                        }
+                        yield ev;
+                    }
+                }
+            }
+        })
+    }
+
+    /// 派生 per-request 超时子 token：超时或 parent 取消任一触发即 abort。对应 TS `withRequestTimeout`。
+    /// 流式 / 下载路径不应套此短超时（会切断长连接），故仅在非流式 JSON 路径使用。
+    fn derive_timeout_token(
+        &self,
+        timeout_ms: u64,
+        parent: Option<CancellationToken>,
+    ) -> Option<CancellationToken> {
+        if timeout_ms == 0 {
+            return parent;
+        }
+        let child = CancellationToken::new();
+        let trigger = child.clone();
+        let parent_clone = parent.clone();
+        tokio::spawn(async move {
+            let timeout = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+            match parent_clone {
+                Some(p) => {
+                    tokio::select! {
+                        _ = timeout => trigger.cancel(),
+                        _ = p.cancelled() => trigger.cancel(),
+                    }
+                }
+                None => {
+                    timeout.await;
+                    trigger.cancel();
+                }
+            }
+        });
+        Some(child)
+    }
+
+    // ── 测试辅助（仅 cfg(test)）──
+
+    /// 直接注入未过期 token（测试用，绕过 OAuth 登录流）。对应 TS `primeTokensForTest`。
+    #[cfg(test)]
+    fn prime_tokens_for_test(&self, tokens: TokenSet) {
+        *self.inner.tokens.write().unwrap() = Some(tokens);
+    }
+
+    /// 直接注入 OAuth server 元数据（测试用，绕过 discover）。
+    #[cfg(test)]
+    fn prime_meta_for_test(&self, meta: ServerMetadata) {
+        *self.inner.meta.write().unwrap() = Some(meta);
+    }
+
+    /// 把占位 ManagedModel 塞入缓存（测试用）。对应 TS `primeModelCacheForTest`。
+    #[cfg(test)]
+    fn prime_model_cache_for_test(&self, models: Vec<ManagedModel>) {
+        *self.inner.model_cache.write().unwrap() = models;
+        *self.inner.model_cache_time.write().unwrap() = Some(std::time::Instant::now());
+    }
+}
+
+/// `chat_stream_with_usage` 的 tagged 事件。对应 TS `{kind:'content'|'sources'|'settle'}`。
+#[derive(Debug, Clone)]
+pub enum ChatUsageEvent {
+    /// 内容增量事件。
+    Content(StreamEvent),
+    /// 搜索来源事件。
+    Sources(SourcesEvent),
+    /// 结算事件（token 消耗 + 剩余余额）。
+    Settle(StreamSettlement),
+}
+
+/// 流式请求公共头（Bearer + JSON + SSE Accept）。
+fn stream_headers(token: &str) -> Vec<(reqwest::header::HeaderName, String)> {
+    vec![
+        (reqwest::header::AUTHORIZATION, format!("Bearer {token}")),
+        (
+            reqwest::header::CONTENT_TYPE,
+            "application/json".to_string(),
+        ),
+        (reqwest::header::ACCEPT, "text/event-stream".to_string()),
+    ]
+}
+
+/// 从响应头解析 `Retry-After` 秒数（0 = 无 / 解析失败）。
+fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> i64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(0)
+}
+
+/// 从响应头解析 i64（解析失败 → None）。对应 TS `parseInt(headers.get(...))`。
+fn header_i64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+/// 退避 sleep，可被取消信号打断（取消即立即返回，不再退避）。对应 TS `sleep(ms, signal)`。
+async fn sleep_with_cancel(ms: u64, signal: Option<&CancellationToken>) {
+    let dur = std::time::Duration::from_millis(ms);
+    match signal {
+        Some(cancel) => {
+            tokio::select! {
+                _ = tokio::time::sleep(dur) => {}
+                _ = cancel.cancelled() => {}
+            }
+        }
+        None => tokio::time::sleep(dur).await,
+    }
+}
+
+/// URL path 段编码（对齐 TS `encodeURIComponent`）。仅对 path-segment 不安全字符百分号编码。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// 归一化上游 ManagedModel 列表的 `input_modalities`（snake）→ `inputModalities`（camel）。
@@ -1084,4 +2057,322 @@ fn normalize_base(input: &str, label: &str) -> Result<String> {
     let path = u.path().trim_end_matches('/');
     out.push_str(path);
     Ok(out)
+}
+
+#[cfg(test)]
+mod p4_tests {
+    use super::*;
+    use crate::auth::types::{ServerMetadata, TokenSet};
+    use crate::models::types::ManagedModel;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc as StdArc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // ── 纯函数红线（无需网络）──
+
+    #[test]
+    fn urlencode_matches_encodeuricomponent() {
+        // 普通段不变。
+        assert_eq!(urlencode("claude-opus"), "claude-opus");
+        // 斜杠 / 空格 / 中文须百分号编码（防 path 注入）。
+        assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
+        assert_eq!(urlencode("模型"), "%E6%A8%A1%E5%9E%8B");
+        // encodeURIComponent 保留字符不编码。
+        assert_eq!(urlencode("a-_.!~*'()"), "a-_.!~*'()");
+    }
+
+    #[test]
+    fn header_i64_parses_or_none() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("X-Token-Remaining", "12345".parse().unwrap());
+        h.insert("X-Bad", "nan".parse().unwrap());
+        assert_eq!(header_i64(&h, "X-Token-Remaining"), Some(12345));
+        assert_eq!(header_i64(&h, "X-Bad"), None);
+        assert_eq!(header_i64(&h, "X-Missing"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_secs_filters_nonpositive() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after_secs(&h), 30);
+        h.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(parse_retry_after_secs(&h), 0);
+    }
+
+    /// 流式行解析：[DONE] → done；普通事件 event/data 透传（Anthropic 自然结束靠连接关闭）。
+    #[test]
+    fn anthropic_adapter_parse_stream_line_basic() {
+        let adapter = Adapter::Anthropic;
+        // [DONE] → done。
+        let (_, done) = adapter.parse_stream_line("", "[DONE]").unwrap();
+        assert!(done);
+        // 普通 delta → 非 done，event/data 透传。
+        let (ev, done2) = adapter
+            .parse_stream_line(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            )
+            .unwrap();
+        assert!(!done2);
+        assert_eq!(ev.event, "content_block_delta");
+    }
+
+    #[test]
+    fn endpoint_suffix_routing_per_adapter() {
+        // Anthropic → /anthropic, OpenAI → /chat（chat 端点拼接红线）。
+        assert_eq!(Adapter::Anthropic.endpoint_suffix(), "/anthropic");
+        assert_eq!(Adapter::OpenAI.endpoint_suffix(), "/chat");
+        let ep = format!(
+            "/managed-models/{}{}",
+            urlencode("m id"),
+            Adapter::OpenAI.endpoint_suffix()
+        );
+        assert_eq!(ep, "/managed-models/m%20id/chat");
+    }
+
+    // ── 端到端：原始 HTTP/1.1 mock server ──
+
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(&'static str, String)>,
+        body: String,
+    }
+    impl MockResponse {
+        fn ok(body: &str) -> Self {
+            Self {
+                status: 200,
+                headers: vec![],
+                body: body.to_string(),
+            }
+        }
+        fn with_header(mut self, k: &'static str, v: &str) -> Self {
+            self.headers.push((k, v.to_string()));
+            self
+        }
+        fn status(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                headers: vec![],
+                body: body.to_string(),
+            }
+        }
+    }
+
+    /// 启一个按到达顺序逐个回放 `responses` 的 mock server，记录收到的 request 行（METHOD PATH）。
+    /// 返回 (base_url, 记录器句柄, JoinHandle)。
+    async fn spawn_mock(
+        responses: Vec<MockResponse>,
+    ) -> (
+        String,
+        StdArc<std::sync::Mutex<Vec<String>>>,
+        StdArc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let log = StdArc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let count = StdArc::new(AtomicUsize::new(0));
+        let log2 = log.clone();
+        let count2 = count.clone();
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+            while idx < responses.len() {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                // 读到 header 结束（\r\n\r\n），再按 Content-Length 读 body（够测试）。
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first = req.lines().next().unwrap_or("").to_string();
+                let parts: Vec<&str> = first.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    log2.lock()
+                        .unwrap()
+                        .push(format!("{} {}", parts[0], parts[1]));
+                }
+                count2.fetch_add(1, AtomicOrdering::SeqCst);
+
+                let r = &responses[idx];
+                idx += 1;
+                let reason = match r.status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    500 => "Internal Server Error",
+                    _ => "Status",
+                };
+                let mut head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    r.status,
+                    reason,
+                    r.body.len()
+                );
+                for (k, v) in &r.headers {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(r.body.as_bytes()).await;
+                let _ = sock.flush().await;
+                // 优雅关闭写端，确保 Content-Length 字节全部送达后再 EOF（避免 reqwest IncompleteBody）。
+                let _ = sock.shutdown().await;
+            }
+        });
+        (base, log, count)
+    }
+
+    fn unexpired_token(base: &str) -> TokenSet {
+        TokenSet {
+            access_token: "AT0".to_string(),
+            refresh_token: "RT0".to_string(),
+            // 远未来。
+            expires_at: "2999-01-01T00:00:00Z".to_string(),
+            scope: String::new(),
+            client_id: "cid".to_string(),
+            server_url: base.to_string(),
+        }
+    }
+
+    fn primed_client(base: &str) -> Client {
+        let client = Client::new(Config {
+            server_url: Some(base.to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        client.prime_tokens_for_test(unexpired_token(base));
+        // 缓存一个 Anthropic 模型，避免 build_chat_request 触发 listModels。
+        client.prime_model_cache_for_test(vec![ManagedModel {
+            id: "test-model".to_string(),
+            provider: "anthropic".to_string(),
+            model_id: "test-model".to_string(),
+            is_enabled: true,
+            ..Default::default()
+        }]);
+        client
+    }
+
+    #[tokio::test]
+    async fn chat_routes_to_anthropic_endpoint_and_reads_headers() {
+        // Anthropic 响应体（最小）。
+        let body = r#"{"id":"msg_1","type":"message","model":"test-model","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let resp = MockResponse::ok(body)
+            .with_header("X-Token-Remaining", "999")
+            .with_header("X-Call-Remaining", "42");
+        let (base, log, _) = spawn_mock(vec![resp]).await;
+        let client = primed_client(&base);
+
+        let req = ChatRequest::default();
+        let out = client.chat("test-model", &req, None).await.unwrap();
+        // 端点路由红线：POST 到 /api/v4/managed-models/test-model/anthropic。
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            "POST /api/v4/managed-models/test-model/anthropic"
+        );
+        // 响应头余额回填。
+        assert_eq!(out.token_remaining, 999);
+        assert_eq!(out.call_remaining, 42);
+        assert_eq!(out.id, "msg_1");
+    }
+
+    #[tokio::test]
+    async fn do_json_full_empty_body_returns_none() {
+        // 空体成功响应 → Ok(None)（方案 §4.4 空体契约）。
+        let (base, _, _) = spawn_mock(vec![MockResponse::ok("")]).await;
+        let client = Client::new(Config {
+            server_url: Some(base.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        client.prime_tokens_for_test(unexpired_token(&base));
+        let (out, _) = client
+            .do_json_full::<serde_json::Value>(reqwest::Method::GET, "/whatever", None, None)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_401_single_refresh_retry_then_succeeds() {
+        // 序列：①chat POST → 401 ②token_endpoint refresh → 200 新 token ③chat POST 重试 → 200。
+        let chat_body = r#"{"id":"msg_2","type":"message","model":"test-model","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let token_body = r#"{"access_token":"AT1","token_type":"Bearer","expires_in":3600,"refresh_token":"RT1"}"#;
+        let (base, log, count) = spawn_mock(vec![
+            MockResponse::status(401, "{}"),
+            MockResponse::ok(token_body),
+            MockResponse::ok(chat_body),
+        ])
+        .await;
+
+        let client = primed_client(&base);
+        // 注入 meta，使 force_refresh 的 refresh_direct 不触发 discover，直接打 token_endpoint。
+        client.prime_meta_for_test(ServerMetadata {
+            issuer: base.clone(),
+            authorization_endpoint: format!("{base}/authorize"),
+            token_endpoint: format!("{base}/token"),
+            revocation_endpoint: format!("{base}/revoke"),
+            registration_endpoint: format!("{base}/register"),
+            scopes_supported: vec![],
+        });
+
+        let req = ChatRequest::default();
+        let out = client.chat("test-model", &req, None).await.unwrap();
+        assert_eq!(out.id, "msg_2");
+
+        let recorded = log.lock().unwrap().clone();
+        // 红线：恰 3 次请求（chat 401 → refresh → chat 重试），不无限递归。
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 3, "exactly one retry");
+        assert_eq!(
+            recorded[0],
+            "POST /api/v4/managed-models/test-model/anthropic"
+        );
+        assert!(
+            recorded[1].starts_with("POST /token"),
+            "refresh hits token_endpoint: {}",
+            recorded[1]
+        );
+        assert_eq!(
+            recorded[2],
+            "POST /api/v4/managed-models/test-model/anthropic"
+        );
+        // token 已轮换。
+        assert_eq!(client.token_set().unwrap().access_token, "AT1");
+    }
+
+    #[tokio::test]
+    async fn chat_401_twice_does_not_recurse() {
+        // 序列：①chat → 401 ②refresh → 200 ③chat 重试 → 又 401 → 不再重试，抛 HttpError(401)。
+        let token_body = r#"{"access_token":"AT1","token_type":"Bearer","expires_in":3600,"refresh_token":"RT1"}"#;
+        let (base, _log, count) = spawn_mock(vec![
+            MockResponse::status(401, "{}"),
+            MockResponse::ok(token_body),
+            MockResponse::status(401, "{}"),
+        ])
+        .await;
+        let client = primed_client(&base);
+        client.prime_meta_for_test(ServerMetadata {
+            issuer: base.clone(),
+            authorization_endpoint: format!("{base}/authorize"),
+            token_endpoint: format!("{base}/token"),
+            revocation_endpoint: format!("{base}/revoke"),
+            registration_endpoint: format!("{base}/register"),
+            scopes_supported: vec![],
+        });
+        let req = ChatRequest::default();
+        let err = client.chat("test-model", &req, None).await.unwrap_err();
+        match err {
+            Error::Http(h) => assert_eq!(h.status_code, 401),
+            other => panic!("expected HttpError(401), got {other:?}"),
+        }
+        // 红线：第二次 401 不再触发 refresh/重试 —— 恰 3 次请求。
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            3,
+            "guard prevents recursion"
+        );
+    }
 }
