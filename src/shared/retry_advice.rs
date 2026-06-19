@@ -98,7 +98,163 @@ pub fn retry_reason_for_oauth_error(oauth_error: &str) -> RetryAdviceReason {
     }
 }
 
-// P6（compliance 落地后补齐）：
-//   - COMPLIANCE_KEY_TO_RETRY_REASON 映射表（穷举 ComplianceErrorKey）
-//   - retry_reason_for_compliance_key(key) -> RetryAdviceReason
-//   - compliance_error_to_retry_advice(info: &ComplianceErrorInfo) -> RetryAdvice
+// =============================================================================
+// compliance 错误 key → reason 映射（P1 延后，P6 compliance 落地后补齐）。
+//
+// 依赖 `compliance::errors::{ComplianceErrorKey, ComplianceErrorInfo}`。Rust 中 shared 与
+// compliance 同 crate 跨模块互引不构成循环（compliance::errors 引 shared::errors::Error，
+// 本处引 compliance::errors::ComplianceErrorKey，无类型定义环）。
+// =============================================================================
+
+use crate::compliance::errors::{ComplianceErrorInfo, ComplianceErrorKey};
+
+/// `ComplianceErrorKey` → `RetryAdviceReason`。**穷举映射**（match 缺分支 = 编译错误，
+/// 保证后端新增 key 时 Rust 侧强制更新）。对应 TS `COMPLIANCE_KEY_TO_RETRY_REASON`。
+pub fn retry_reason_for_compliance_key(key: ComplianceErrorKey) -> RetryAdviceReason {
+    use ComplianceErrorKey as K;
+    use RetryAdviceReason as R;
+    match key {
+        // 通用 / token / scope
+        K::ComplianceUnauthorized => R::Failed,
+        K::ComplianceInsufficientScope => R::InsufficientScope,
+        K::ComplianceStepUpRequired => R::StepUpRequired,
+        K::ComplianceTokenInvalid => R::Failed,
+        // 主体快照
+        K::SubjectSnapshotRequired => R::Failed,
+        K::SubjectSnapshotNotFound => R::Failed,
+        K::SubjectSnapshotTenantMismatch => R::TenantMismatch,
+        // Evidence / Timestamp / Package / Report
+        K::EvidenceAssetNotFound => R::Failed,
+        K::EvidenceAssetHashMismatch => R::LocalVerifyFailed,
+        K::EvidenceAssetPayloadRequired => R::Failed,
+        K::TimestampTokenNotFound => R::Failed,
+        K::TimestampProviderFailed => R::Failed,
+        K::TimestampProviderUnknown => R::Unknown,
+        K::TimestampLocalVerifyFailed => R::LocalVerifyFailed,
+        K::TimestampProviderNotAvailable => R::ProviderTimeout,
+        K::EvidencePackageNotFound => R::Failed,
+        K::EvidencePackageTimestampRequired => R::Failed,
+        K::EvidencePackageManifestHashMismatch => R::LocalVerifyFailed,
+        K::ReportNotFound => R::Failed,
+        K::ReportAlreadyPublished => R::Failed,
+        K::ReportDraftRequired => R::Failed,
+        K::EvidenceVerifyTargetRequired => R::Failed,
+        K::EvidenceVerifyTargetNotFound => R::Failed,
+        // Provider request
+        K::ProviderRequestUnknownNoRetry => R::Unknown,
+        K::ProviderCallbackSourceInvalid => R::Failed,
+        K::ProviderNotConfigured => R::GateClosed,
+        K::ProviderRequestNotFound => R::Failed,
+        K::ProviderRequestIdempotencyRequired => R::Failed,
+        K::ProviderRequestStatusNotTerminal => R::Retrying,
+        // Envelope
+        K::EnvelopeNotFound => R::Failed,
+        K::EnvelopeTenantMismatch => R::TenantMismatch,
+        K::EnvelopeStateNotAllowed => R::Failed,
+        K::EnvelopeGateClosed => R::GateClosed,
+        K::ContractNotFound => R::Failed,
+        K::ContractHashMismatch => R::LocalVerifyFailed,
+        K::ProviderAuthorizationNotConfirmed => R::Failed,
+        K::EnvelopeEvidenceNotReady => R::Retrying,
+        // Seal approval / use
+        K::SealAssetNotFound => R::Failed,
+        K::SealApprovalNotFound => R::Failed,
+        K::SealApprovalStateNotApproved => R::Failed,
+        K::SealApprovalExpired => R::Failed,
+        K::SealApprovalAlreadyUsed => R::Failed,
+        K::SealApprovalNonceUsed => R::Failed,
+        K::SealApprovalSealMismatch => R::Failed,
+        K::SealApprovalLocationMismatch => R::Failed,
+        K::SealApprovalTransactorMismatch => R::Failed,
+        K::SealApprovalContractHashMismatch => R::LocalVerifyFailed,
+        K::SealApprovalInvalidTransition => R::Failed,
+        K::SealUseAlreadyConsumed => R::Failed,
+        // Audit chain
+        K::AuditChainTamperDetected => R::LocalVerifyFailed,
+        // Billing
+        K::BillingCommitRequiresLocalVerify => R::LocalVerifyFailed,
+        K::BillingCommitRequiresProviderSuccess => R::BillingPreflightFailed,
+        K::BillingCallbackCannotCommit => R::BillingPreflightFailed,
+        K::BillingProviderUnknownNotCommittable => R::BillingPreflightFailed,
+        K::BillingS2sForbidden => R::Failed,
+        // SDK fallback
+        K::UnknownComplianceError => R::Unknown,
+    }
+}
+
+/// `ComplianceErrorInfo` → `RetryAdvice`。对应 TS `complianceErrorToRetryAdvice`。
+pub fn compliance_error_to_retry_advice(info: &ComplianceErrorInfo) -> RetryAdvice {
+    RetryAdvice {
+        retryable: info.retryable,
+        retry_after: None,
+        same_idempotency_key_required: !info.terminal,
+        manual_action_required: info.terminal || info.step_up_required,
+        reason: retry_reason_for_compliance_key(info.key),
+        user_message: None,
+        developer_message: Some(info.message.clone()),
+        support_code: Some(format!("compliance:{}", info.code)),
+    }
+}
+
+#[cfg(test)]
+mod compliance_tests {
+    use super::*;
+
+    #[test]
+    fn step_up_key_maps() {
+        assert_eq!(
+            retry_reason_for_compliance_key(ComplianceErrorKey::ComplianceStepUpRequired),
+            RetryAdviceReason::StepUpRequired
+        );
+        assert_eq!(
+            retry_reason_for_compliance_key(ComplianceErrorKey::EnvelopeGateClosed),
+            RetryAdviceReason::GateClosed
+        );
+        assert_eq!(
+            retry_reason_for_compliance_key(ComplianceErrorKey::SubjectSnapshotTenantMismatch),
+            RetryAdviceReason::TenantMismatch
+        );
+        assert_eq!(
+            retry_reason_for_compliance_key(ComplianceErrorKey::UnknownComplianceError),
+            RetryAdviceReason::Unknown
+        );
+    }
+
+    #[test]
+    fn advice_terminal_sets_manual_and_drops_same_key() {
+        let info = ComplianceErrorInfo {
+            code: 1031004004,
+            message: "gate closed".to_string(),
+            key: ComplianceErrorKey::EnvelopeGateClosed,
+            retryable: false,
+            terminal: true,
+            step_up_required: false,
+        };
+        let advice = compliance_error_to_retry_advice(&info);
+        assert!(!advice.retryable);
+        assert!(advice.manual_action_required);
+        assert!(!advice.same_idempotency_key_required);
+        assert_eq!(advice.reason, RetryAdviceReason::GateClosed);
+        assert_eq!(
+            advice.support_code.as_deref(),
+            Some("compliance:1031004004")
+        );
+    }
+
+    #[test]
+    fn advice_step_up_requires_manual() {
+        let info = ComplianceErrorInfo {
+            code: 1031000013,
+            message: "step up".to_string(),
+            key: ComplianceErrorKey::ComplianceStepUpRequired,
+            retryable: false,
+            terminal: false,
+            step_up_required: true,
+        };
+        let advice = compliance_error_to_retry_advice(&info);
+        assert!(advice.manual_action_required);
+        // 非终态 → 仍要求同一幂等键。
+        assert!(advice.same_idempotency_key_required);
+        assert_eq!(advice.reason, RetryAdviceReason::StepUpRequired);
+    }
+}

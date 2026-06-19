@@ -35,11 +35,13 @@ mod macros;
 pub mod agent_runs;
 pub mod auth;
 pub mod billing;
+pub mod compliance;
 pub mod core;
 pub mod models;
 pub mod notifications;
 pub mod shared;
 pub mod skills;
+pub mod support;
 
 // 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
 pub use crate::auth::{
@@ -107,6 +109,31 @@ pub use crate::agent_runs::{
     PermissionPolicy, RemoteControlEvent, RemotePermissionResultRequest, RemoteSessionTokenGrant,
     RemoteUserMessageAck, RemoteUserMessageRequest, RunnerKind, WorkspacePolicy,
 };
+// === compliance 域逐项 re-export（对齐 compliance/index.ts）===
+pub use crate::compliance::{
+    classify_compliance_error, compliance_scopes, is_billing_confirmable,
+    is_compliance_business_error, is_compliance_terminal_error, ApproveSealApprovalQuery,
+    CancelSealApprovalQuery, ComplianceBillingDisplayStatus, ComplianceCapability,
+    ComplianceClient, ComplianceEnvelopeStatus, ComplianceErrorInfo, ComplianceErrorKey,
+    CompliancePollError, CompliancePollErrorKind, CompliancePollOptions,
+    ComplianceProviderRequestStatus, ComplianceProviderStatus, ComplianceReport,
+    ComplianceSealApprovalStatus, ComplianceWriteOptions, ContractTemplateField,
+    ContractTemplateFieldType, ContractTemplatePageItem, ContractTemplateResp,
+    ContractTemplateStatus, ContractTemplateVersion, CreateContractTemplateRequest,
+    CreateEvidenceAssetRequest, CreateH5SigningUrlRequest, CreateReportRequest,
+    CreateSigningEnvelopeRequest, EnvelopeContractItem, EvidenceAsset, EvidenceAssetPageItem,
+    EvidencePackage, EvidencePackagePageItem, IssueTimestampRequest, ListContractTemplatesRequest,
+    ListEvidenceAssetsRequest, ListEvidencePackagesRequest, ListOperationsRequest,
+    ListReportsRequest, ListSealApprovalsRequest, ListSealUsesRequest, ListSigningEnvelopesRequest,
+    ListTimestampsRequest, OperationBase, OperationDetail, OperationPageItem,
+    ProviderRequestStatusView, PublicEvidenceVerifyResult, RejectSealApprovalQuery, ReportDownload,
+    ReportPageItem, SealApproval, SealApprovalPageItem, SealUsePageItem, SignEnvelopeRequest,
+    SigningEnvelope, SigningEnvelopePageItem, SubmitSealApprovalRequest, TimestampPageItem,
+    TimestampToken, TimestampVerifyResult, TsaProvider, TsaStats, UpdateContractTemplateRequest,
+    UploadContractTemplatePdfRequest, VerifyTimestampRequest, VoidEnvelopeRequest,
+};
+// === support 域逐项 re-export（对齐 support/index.ts）===
+pub use crate::support::{BugReportResult, BugView};
 pub use shared::{Error, Result};
 
 #[cfg(test)]
