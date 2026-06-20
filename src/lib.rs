@@ -81,16 +81,16 @@ pub use crate::models::{
     new_thinking_config, new_web_search_tool, parse_settlement, parse_sources_event, unique_merge,
     validate_end_user_id, zero_model_capabilities, Adapter, AnthropicContentBlock,
     AnthropicResponse, AnthropicUsage, BlockMeta, BucketInfo, BucketRow, ChatContentBlock,
-    ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig, EmbeddingData,
-    EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, GeoLoc,
-    ImageGenerationRequest, ImageGenerationResponse, InputModality, ManagedModel,
-    ModelCapabilities, OpenAIChatChoice, OpenAIChatMessage, OpenAIChatResponse, OpenAIFunctionCall,
+    ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig, EmbeddingData, EmbeddingInput,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, GeoLoc, ImageGenerationRequest,
+    ImageGenerationResponse, InputModality, ManagedModel, ModelCapabilities, MultimodalContent,
+    OpenAIChatChoice, OpenAIChatMessage, OpenAIChatResponse, OpenAIFunctionCall,
     OpenAIStreamChoice, OpenAIStreamChunk, OpenAIStreamConverter, OpenAIStreamDelta,
     OpenAIStreamToolCall, OpenAIToolCall, OpenAIUsage, OutputConfig, ProviderFormat, QuotaSummary,
-    RerankRequest, RerankResponse, RerankResult,
-    ServerTool, SourcesEvent, StreamEvent, StreamSettlement, ThinkingConfig,
-    VideoGenerationRequest, VideoTaskResponse, WebSearchConfig, WebSearchSource,
-    MAX_END_USER_ID_LENGTH, SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
+    RerankDocument, RerankQuery, RerankRequest, RerankResponse, RerankResult, ServerTool,
+    SourcesEvent, StreamEvent, StreamSettlement, ThinkingConfig, VideoGenerationRequest,
+    VideoTaskResponse, WebSearchConfig, WebSearchSource, MAX_END_USER_ID_LENGTH,
+    SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
 };
 // === billing 域逐项 re-export（对齐 billing/index.ts）===
 pub use crate::billing::{
@@ -192,6 +192,6 @@ mod scaffold_tests {
 
     #[test]
     fn version_is_wired() {
-        assert_eq!(VERSION, "2.9.0");
+        assert_eq!(VERSION, "2.10.0");
     }
 }

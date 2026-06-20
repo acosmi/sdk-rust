@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [2.10.0] - 2026-06-20 — 多模态向量 / 重排序 (qwen3-vl-embedding / qwen3-vl-rerank)
+
+向量与重排序端点扩展为**多模态**（text / image / **video**），对接 DashScope `qwen3-vl-embedding`（多模态向量端点）与 `qwen3-vl-rerank`（原生 rerank 端点 + 多模态 content）。面向自建搜索引擎的图文 / 视频检索场景。计费口径不变（`total_tokens` 套 input 费率），上游模型名仍由管理员后台自填。与 `@acosmi/sdk-ts` v2.10.0 同步。
+
+### Added
+
+- **`EmbeddingRequest.contents`** — 多模态向量输入：`Option<Vec<MultimodalContent>>`（`{ text?, image?, video? }`）。与 `input` 二选一。新增可选 `output_type` / `fps` / `enable_fusion` 字段。
+- **`RerankQuery` / `RerankDocument`**（untagged 枚举）— `query: RerankQuery`（`Text(String) | Multimodal(MultimodalContent)`），`documents: Vec<RerankDocument>`（同上含 video）。提供 `From<&str>` / `From<String>` / `From<MultimodalContent>` impl，纯文本调用经 `.into()` 不变。新增可选 `fps`。
+- **类型** — `MultimodalContent` / `RerankQuery` / `RerankDocument`（crate 根 re-export）。
+
+### Changed
+
+- **`EmbeddingRequest.input` 改为 `Option<EmbeddingInput>`** 并为 `EmbeddingRequest` 派生 `Default`——多模态线路用 `contents`。文本调用改用 `input: Some(...)` + `..Default::default()`。
+- **`RerankRequest.query` / `documents`** 类型由 `String` / `Vec<String>` 改为 `RerankQuery` / `Vec<RerankDocument>`；字符串字面量经 `.into()` 兼容。`RerankRequest` 新增 `fps` 字段（构造时须显式给出，缺省 `None`）。
+
+> 注：v2.9.0 当时仅落地于任务分支、未发布到 crates.io，故本次以 2.10.0 一次性发布；上述结构体字面量变更对已发布版本无破坏面。
+
 ## [2.9.0] - 2026-06-20 — 向量 (Embedding) + 重排序 (Rerank) 端点
 
 托管模型网关新增向量与重排序两类模型（上游接阿里云百炼 DashScope），SDK 订阅会员可经现有会员计费体系（Hold→Settle→Release，按 `total_tokens` 套 input 费率）直接调用。具体上游模型名（`text-embedding-v4` / `gte-rerank-v2` / `qwen3-rerank` 等）由管理员在托管模型后台自填，不在 SDK / 网关硬编码。与 `@acosmi/sdk-ts` v2.9.0 同步。

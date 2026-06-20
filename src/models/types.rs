@@ -143,17 +143,45 @@ pub enum EmbeddingInput {
     Batch(Vec<String>),
 }
 
-/// 向量请求（`embeddings`）。对外 = OpenAI `/v1/embeddings` 标准。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 多模态内容片段（v2.10+；向量/重排序 `qwen3-vl-embedding` / `qwen3-vl-rerank` 线路）。
+/// `text` / `image` / `video` 至少填一项；`image` / `video` 取 URL 或 base64 data URI。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MultimodalContent {
+    /// 文本片段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// 图片（URL 或 base64 data URI）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// 视频（URL）；仅多模态线路支持。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<String>,
+}
+
+/// 向量请求（`embeddings`）。文本线路 = OpenAI `/v1/embeddings` 标准；多模态线路用 `contents`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmbeddingRequest {
-    /// 待向量化的文本（单条）或文本数组（批量）。
-    pub input: EmbeddingInput,
+    /// 文本输入（文本向量线路）：单条或批量。多模态线路改用 `contents`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<EmbeddingInput>,
+    /// 多模态内容（v2.10+；`qwen3-vl-embedding` 线路）：text/image/video 片段数组。与 `input` 二选一。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents: Option<Vec<MultimodalContent>>,
     /// 向量维度（可选；DashScope text-embedding-v4 支持 2048/1536/1024/768/512/256/128/64）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<i64>,
     /// 编码格式（可选，如 `"float"`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding_format: Option<String>,
+    /// 输出向量类型（可选；多模态线路，如 `"dense"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_type: Option<String>,
+    /// 视频抽帧率 fps（可选；多模态视频输入）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    /// 是否启用多模态特征融合（可选；多模态线路）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_fusion: Option<bool>,
 }
 
 /// 单条向量结果（OpenAI 标准）。
@@ -191,13 +219,65 @@ pub struct EmbeddingResponse {
     pub id: Option<String>,
 }
 
+/// 重排序查询（v2.10+）：文本字符串，或多模态 `{text|image}`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RerankQuery {
+    /// 文本查询。
+    Text(String),
+    /// 多模态查询（`{text|image}`）。
+    Multimodal(MultimodalContent),
+}
+
+impl From<String> for RerankQuery {
+    fn from(s: String) -> Self {
+        RerankQuery::Text(s)
+    }
+}
+impl From<&str> for RerankQuery {
+    fn from(s: &str) -> Self {
+        RerankQuery::Text(s.to_string())
+    }
+}
+impl From<MultimodalContent> for RerankQuery {
+    fn from(c: MultimodalContent) -> Self {
+        RerankQuery::Multimodal(c)
+    }
+}
+
+/// 重排序候选文档（v2.10+）：文本字符串，或多模态 `{text|image|video}`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RerankDocument {
+    /// 文本文档。
+    Text(String),
+    /// 多模态文档（`{text|image|video}`）。
+    Multimodal(MultimodalContent),
+}
+
+impl From<String> for RerankDocument {
+    fn from(s: String) -> Self {
+        RerankDocument::Text(s)
+    }
+}
+impl From<&str> for RerankDocument {
+    fn from(s: &str) -> Self {
+        RerankDocument::Text(s.to_string())
+    }
+}
+impl From<MultimodalContent> for RerankDocument {
+    fn from(c: MultimodalContent) -> Self {
+        RerankDocument::Multimodal(c)
+    }
+}
+
 /// 重排序请求（`rerank`）。统一扁平契约，网关内部按模型线路转换。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankRequest {
-    /// 查询文本。
-    pub query: String,
-    /// 候选文档列表。
-    pub documents: Vec<String>,
+    /// 查询：文本字符串（文本线路），或多模态 `{text|image}`（`qwen3-vl-rerank` 线路）。
+    pub query: RerankQuery,
+    /// 候选文档：文本字符串或多模态 `{text|image|video}` 对象列表。
+    pub documents: Vec<RerankDocument>,
     /// 返回前 N 条（可选；缺省返回全部）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<i64>,
@@ -207,6 +287,9 @@ pub struct RerankRequest {
     /// 排序指令（可选；仅 OpenAI 兼容线路支持，原生线路忽略）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruct: Option<String>,
+    /// 视频抽帧率 fps（可选；多模态视频文档）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
 }
 
 /// 单条重排序结果。

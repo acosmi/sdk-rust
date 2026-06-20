@@ -1,6 +1,6 @@
 [package]
 name = "acosmi-sdk"
-version = "2.9.0"
+version = "2.10.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Acosmi Rust SDK：模型网关、Agent Run Gateway 与 Compliance 统一客户端。双格式（Anthropic + OpenAI）。端口自 acosmi-sdk-ts。"

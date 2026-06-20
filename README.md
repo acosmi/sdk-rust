@@ -157,9 +157,9 @@ let models = client.list_models(None, false).await?;
 // 向量（同步）
 if let Some(m) = models.iter().find(|m| m.capabilities.supports_embedding == Some(true)) {
     let resp = client.embeddings(&m.id, &EmbeddingRequest {
-        input: EmbeddingInput::Batch(vec!["第一段".into(), "第二段".into()]),
+        input: Some(EmbeddingInput::Batch(vec!["第一段".into(), "第二段".into()])),
         dimensions: Some(1024),
-        encoding_format: None,
+        ..Default::default()
     }, None).await?;
     println!("{} 维, {} tokens", resp.data[0].embedding.len(), resp.usage.total_tokens);
 }
@@ -172,6 +172,7 @@ if let Some(m) = models.iter().find(|m| m.capabilities.supports_rerank == Some(t
         top_n: Some(2),
         return_documents: Some(true),
         instruct: None,
+        fps: None,
     }, None).await?;
     for r in &resp.results {
         println!("#{} score={} {:?}", r.index, r.relevance_score, r.document);
@@ -181,6 +182,44 @@ if let Some(m) = models.iter().find(|m| m.capabilities.supports_rerank == Some(t
 ```
 
 > 重排序对外是统一扁平契约；网关内部按模型绑定线路（原生嵌套 `gte-rerank-v2` / OpenAI 兼容扁平 `qwen3-rerank`）自动转换并归一化响应。
+
+### 多模态向量 / 重排序（v2.10+，text / image / video）
+
+对接 DashScope `qwen3-vl-embedding`（多模态向量）与 `qwen3-vl-rerank`（多模态重排序）。向量用 `contents` 取代 `input`；重排序的 `query` / `documents` 接受多模态对象 `MultimodalContent { text?, image?, video? }`（也可混入纯文本字符串）。适用于自建搜索引擎的图文 / 视频检索。
+
+```rust,no_run
+# use acosmi::{EmbeddingRequest, RerankRequest, MultimodalContent};
+# async fn demo(client: &acosmi::Client, mm_emb: &str, mm_rerank: &str) -> Result<(), Box<dyn std::error::Error>> {
+// 多模态向量：图 / 视频 / 文本混合
+let emb = client.embeddings(mm_emb, &EmbeddingRequest {
+    contents: Some(vec![
+        MultimodalContent { text: Some("一只橘猫".into()), ..Default::default() },
+        MultimodalContent { image: Some("https://…/cat.png".into()), ..Default::default() },
+        MultimodalContent { video: Some("https://…/clip.mp4".into()), ..Default::default() },
+    ]),
+    output_type: Some("dense".into()),
+    fps: Some(2.0),
+    ..Default::default()
+}, None).await?;
+println!("{} 维", emb.data[0].embedding.len());
+
+// 多模态重排序：query 与候选可为多模态对象，也可混入纯文本字符串
+let rr = client.rerank(mm_rerank, &RerankRequest {
+    query: MultimodalContent { text: Some("红色跑车".into()), ..Default::default() }.into(),
+    documents: vec![
+        MultimodalContent { image: Some("https://…/car.png".into()), ..Default::default() }.into(),
+        "一段描述文字".into(),
+    ],
+    top_n: Some(5),
+    return_documents: None,
+    instruct: None,
+    fps: Some(1.5),
+}, None).await?;
+println!("{} 条", rr.results.len());
+# Ok(()) }
+```
+
+> 文本调用完全向后兼容：`input` / 字符串 `query` / 字符串 `documents`（经 `.into()`）行为不变。多模态托管模型须由管理员在后台勾选对应能力位与输入模态（text/image/video）。
 
 ## 流式
 

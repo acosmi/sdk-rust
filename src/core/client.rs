@@ -2502,19 +2502,22 @@ mod p4_tests {
     fn embedding_rerank_request_serialization() {
         // EmbeddingInput untagged: Single → 裸字符串, Batch → 数组; 可选字段缺省不出现。
         let single = EmbeddingRequest {
-            input: crate::models::types::EmbeddingInput::Single("hello".into()),
+            input: Some(crate::models::types::EmbeddingInput::Single("hello".into())),
             dimensions: Some(512),
-            encoding_format: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(&single).unwrap();
         assert_eq!(v["input"], serde_json::json!("hello"));
         assert_eq!(v["dimensions"], serde_json::json!(512));
         assert!(v.get("encoding_format").is_none());
+        assert!(v.get("contents").is_none());
 
         let batch = EmbeddingRequest {
-            input: crate::models::types::EmbeddingInput::Batch(vec!["a".into(), "b".into()]),
-            dimensions: None,
-            encoding_format: None,
+            input: Some(crate::models::types::EmbeddingInput::Batch(vec![
+                "a".into(),
+                "b".into(),
+            ])),
+            ..Default::default()
         };
         let vb = serde_json::to_value(&batch).unwrap();
         assert_eq!(vb["input"], serde_json::json!(["a", "b"]));
@@ -2526,6 +2529,7 @@ mod p4_tests {
             top_n: Some(2),
             return_documents: Some(true),
             instruct: None,
+            fps: None,
         };
         let vr = serde_json::to_value(&rr).unwrap();
         assert_eq!(vr["query"], serde_json::json!("q"));
@@ -2533,6 +2537,78 @@ mod p4_tests {
         assert_eq!(vr["top_n"], serde_json::json!(2));
         assert_eq!(vr["return_documents"], serde_json::json!(true));
         assert!(vr.get("instruct").is_none());
+        assert!(vr.get("fps").is_none());
+    }
+
+    #[test]
+    fn multimodal_embedding_rerank_serialization() {
+        use crate::models::types::MultimodalContent;
+        // 多模态向量: contents 取代 input, 多模态参数透传。
+        let emb = EmbeddingRequest {
+            contents: Some(vec![
+                MultimodalContent {
+                    text: Some("一只猫".into()),
+                    ..Default::default()
+                },
+                MultimodalContent {
+                    image: Some("https://x/cat.png".into()),
+                    ..Default::default()
+                },
+                MultimodalContent {
+                    video: Some("https://x/clip.mp4".into()),
+                    ..Default::default()
+                },
+            ]),
+            output_type: Some("dense".into()),
+            fps: Some(2.0),
+            enable_fusion: Some(true),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&emb).unwrap();
+        assert!(v.get("input").is_none(), "input 缺省不出现");
+        assert_eq!(v["contents"][0]["text"], serde_json::json!("一只猫"));
+        assert_eq!(
+            v["contents"][1]["image"],
+            serde_json::json!("https://x/cat.png")
+        );
+        assert_eq!(
+            v["contents"][2]["video"],
+            serde_json::json!("https://x/clip.mp4")
+        );
+        // image/video 在纯文本片段里缺省不出现
+        assert!(v["contents"][0].get("image").is_none());
+        assert_eq!(v["output_type"], serde_json::json!("dense"));
+        assert_eq!(v["fps"], serde_json::json!(2.0));
+        assert_eq!(v["enable_fusion"], serde_json::json!(true));
+
+        // 多模态重排序: query / documents 为多模态对象, 也可混入纯文本字符串。
+        let rr = RerankRequest {
+            query: MultimodalContent {
+                text: Some("红色跑车".into()),
+                ..Default::default()
+            }
+            .into(),
+            documents: vec![
+                MultimodalContent {
+                    image: Some("https://x/car.png".into()),
+                    ..Default::default()
+                }
+                .into(),
+                "一段文字".into(),
+            ],
+            top_n: None,
+            return_documents: None,
+            instruct: None,
+            fps: Some(1.5),
+        };
+        let vr = serde_json::to_value(&rr).unwrap();
+        assert_eq!(vr["query"]["text"], serde_json::json!("红色跑车"));
+        assert_eq!(
+            vr["documents"][0]["image"],
+            serde_json::json!("https://x/car.png")
+        );
+        assert_eq!(vr["documents"][1], serde_json::json!("一段文字"));
+        assert_eq!(vr["fps"], serde_json::json!(1.5));
     }
 
     #[tokio::test]
@@ -2542,16 +2618,20 @@ mod p4_tests {
         let client = primed_client(&base);
 
         let req = EmbeddingRequest {
-            input: crate::models::types::EmbeddingInput::Single("hello".into()),
+            input: Some(crate::models::types::EmbeddingInput::Single("hello".into())),
             dimensions: Some(512),
-            encoding_format: None,
+            ..Default::default()
         };
-        let resp = client.embeddings("text-embedding-v4", &req, None).await.unwrap();
+        let resp = client
+            .embeddings("text-embedding-v4", &req, None)
+            .await
+            .unwrap();
 
         let recorded = log.lock().unwrap().clone();
         assert_eq!(recorded.len(), 1);
         assert!(
-            recorded[0].contains("POST") && recorded[0].contains("/managed-models/text-embedding-v4/embeddings"),
+            recorded[0].contains("POST")
+                && recorded[0].contains("/managed-models/text-embedding-v4/embeddings"),
             "unexpected request line: {}",
             recorded[0]
         );
@@ -2573,12 +2653,14 @@ mod p4_tests {
             top_n: Some(2),
             return_documents: Some(true),
             instruct: None,
+            fps: None,
         };
         let resp = client.rerank("gte-rerank-v2", &req, None).await.unwrap();
 
         let recorded = log.lock().unwrap().clone();
         assert!(
-            recorded[0].contains("POST") && recorded[0].contains("/managed-models/gte-rerank-v2/rerank"),
+            recorded[0].contains("POST")
+                && recorded[0].contains("/managed-models/gte-rerank-v2/rerank"),
             "unexpected request line: {}",
             recorded[0]
         );
