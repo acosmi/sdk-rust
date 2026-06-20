@@ -376,7 +376,11 @@ let verified = cc.wait_for_timestamp_verified(&token.id, &CompliancePollOptions:
 
 **公开 verify 匿名语义**：`verify_evidence_public` 可匿名调用（未 login 不抛 not-authorized），返回字段**不暴露** PII / 合同原文 / storage bucket+key / provider raw / TSA 证书内部字段。
 
-> 完整合规域 API（证据 / 时间章 / 报告 / envelope / 用印 / 合同模板，含 `// 写` `// step-up` `// gate` 标注）见 docs.rs 的 [`compliance` 模块](https://docs.rs/acosmi-sdk/latest/acosmi/compliance/index.html) 与 [`examples/compliance_*.rs`](./examples/)。
+> 完整合规域指南（scope / 幂等重试 / 分页 / 能力闸门 / 模板 / 错误分类 / 方法成熟度 / 安全边界）见
+> [`docs/compliance.md`](./docs/compliance.md)；PII 角色可见性矩阵见
+> [`docs/pii-role-matrix.md`](./docs/pii-role-matrix.md)。逐方法精确签名见 docs.rs 的
+> [`compliance` 模块](https://docs.rs/acosmi-sdk/latest/acosmi/compliance/index.html)，可运行示例见
+> [`examples/compliance_*.rs`](./examples/)。
 
 ## 取消（CancellationToken）
 
