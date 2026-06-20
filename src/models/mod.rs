@@ -16,9 +16,11 @@ pub mod wire_openai;
 pub use types::{
     bucket_info_is_commercial, bucket_row_is_commercial, new_thinking_config, new_web_search_tool,
     parse_settlement, parse_sources_event, zero_model_capabilities, BucketInfo, BucketRow,
-    ChatContentBlock, ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig, GeoLoc,
+    ChatContentBlock, ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig,
+    EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, GeoLoc,
     ImageGenerationRequest, ImageGenerationResponse, InputModality, ManagedModel,
-    ModelCapabilities, OutputConfig, QuotaSummary, ServerTool, SourcesEvent, StreamEvent,
+    ModelCapabilities, OutputConfig, QuotaSummary, RerankRequest, RerankResponse, RerankResult,
+    ServerTool, SourcesEvent, StreamEvent,
     StreamSettlement, ThinkingConfig, VideoGenerationRequest, VideoTaskResponse, WebSearchConfig,
     WebSearchSource, BUCKET_CLASS_COMMERCIAL, BUCKET_CLASS_GENERIC, SERVER_TOOL_TYPE_WEB_SEARCH,
     THINKING_HIGH, THINKING_HIGH_MIN_MAX_TOKENS, THINKING_MAX, THINKING_MAX_FALLBACK_MAX_TOKENS,

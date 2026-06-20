@@ -145,6 +145,43 @@ let video_model = models.iter().find(|m| m.capabilities.supports_video_generatio
 - **图片（同步）**：`client.generate_image(model_id, &ImageGenerationRequest{..}, None)` 一次调用直接拿图（内部超时与 chat 同级 11min）。
 - **视频（异步）**：`client.generate_video(...)` 返回 `task_id`，再用 `client.poll_video_task(model_id, task_id, Some(duration), None)` 轮询到 `completed`。`duration` 务必回传创建时的秒数——网关据此上报真实视频时长用量。
 
+## 向量 / 重排序（托管模型网关，v2.9+）
+
+向量（embedding）与重排序（rerank）与 chat **同网关、同会员计费**（Hold→Settle→Release，按 `total_tokens` 套 input 费率），上游接阿里云百炼 DashScope。只有 `capabilities.supports_embedding` / `supports_rerank` 为真的模型可调；具体上游模型名由管理员在后台自填。
+
+```rust,no_run
+# use acosmi::{EmbeddingRequest, EmbeddingInput, RerankRequest};
+# async fn demo(client: &acosmi::Client) -> Result<(), Box<dyn std::error::Error>> {
+let models = client.list_models(None, false).await?;
+
+// 向量（同步）
+if let Some(m) = models.iter().find(|m| m.capabilities.supports_embedding == Some(true)) {
+    let resp = client.embeddings(&m.id, &EmbeddingRequest {
+        input: EmbeddingInput::Batch(vec!["第一段".into(), "第二段".into()]),
+        dimensions: Some(1024),
+        encoding_format: None,
+    }, None).await?;
+    println!("{} 维, {} tokens", resp.data[0].embedding.len(), resp.usage.total_tokens);
+}
+
+// 重排序（同步）
+if let Some(m) = models.iter().find(|m| m.capabilities.supports_rerank == Some(true)) {
+    let resp = client.rerank(&m.id, &RerankRequest {
+        query: "什么是文本排序模型".into(),
+        documents: vec!["文档A".into(), "文档B".into()],
+        top_n: Some(2),
+        return_documents: Some(true),
+        instruct: None,
+    }, None).await?;
+    for r in &resp.results {
+        println!("#{} score={} {:?}", r.index, r.relevance_score, r.document);
+    }
+}
+# Ok(()) }
+```
+
+> 重排序对外是统一扁平契约；网关内部按模型绑定线路（原生嵌套 `gte-rerank-v2` / OpenAI 兼容扁平 `qwen3-rerank`）自动转换并归一化响应。
+
 ## 流式
 
 流式返回 `impl Stream`，用 `futures::StreamExt` 消费；取消走 `tokio_util::sync::CancellationToken`（取代 TS `AbortSignal`）。
@@ -278,7 +315,7 @@ let client = Client::new(Config {
 
 | 域 | 入口 | 主要能力 |
 | --- | --- | --- |
-| **core** | `Client` | 构造 / 认证 / 模型列举 / chat（同步+流式）/ 图片视频生成 |
+| **core** | `Client` | 构造 / 认证 / 模型列举 / chat（同步+流式）/ 图片视频生成 / 向量+重排序 |
 | **models** | `models::*` | 双 adapter 选路 / ManagedModel catalog / web search tool / 能力 helper |
 | **auth** | 自由函数 | OAuth 2.1 PKCE 原语 / scope helper / TokenSet |
 | **agent_runs** | `Client::agent_runs()` | 云端智能体 run / 流式 / 本地工具桥 / 远程控制 / BYOK |

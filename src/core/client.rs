@@ -25,9 +25,9 @@ use crate::models::is_sse_comment_line;
 use crate::models::stream_meta::{extract_anthropic_block_meta, BlockMeta};
 use crate::models::types::{
     parse_settlement, parse_sources_event, zero_model_capabilities, ChatRequest, ChatResponse,
-    ImageGenerationRequest, ImageGenerationResponse, InputModality, ManagedModel,
-    ModelCapabilities, QuotaSummary, SourcesEvent, StreamEvent, StreamSettlement,
-    VideoGenerationRequest, VideoTaskResponse,
+    EmbeddingRequest, EmbeddingResponse, ImageGenerationRequest, ImageGenerationResponse,
+    InputModality, ManagedModel, ModelCapabilities, QuotaSummary, RerankRequest, RerankResponse,
+    SourcesEvent, StreamEvent, StreamSettlement, VideoGenerationRequest, VideoTaskResponse,
 };
 use crate::models::wire_anthropic::AnthropicResponse;
 use crate::shared::api_response::ApiResponse;
@@ -1469,6 +1469,61 @@ impl Client {
     }
 
     // ===========================================================================
+    // 向量 / 重排序（v2.9.0）—— 与 chat 同网关、同会员计费（Hold→Settle→Release）
+    // ===========================================================================
+
+    /// 向量（同步）。`POST /managed-models/:id/embeddings`。对应 TS `embeddings`。
+    ///
+    /// `model_id` 须为向量托管模型（`capabilities.supports_embedding=true`，上游接 DashScope）。
+    /// 响应为 OpenAI `/v1/embeddings` 标准格式（网关直通，无 `{code,data}` 包装）。
+    pub async fn embeddings(
+        &self,
+        model_id: &str,
+        req: &EmbeddingRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<EmbeddingResponse> {
+        let endpoint = format!("/managed-models/{}/embeddings", urlencode(model_id));
+        let body = serde_json::to_string(req)
+            .map_err(|e| Error::other(format!("serialize embedding request: {e}")))?;
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&body),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| Error::other(format!("{endpoint}: decode: {e}")))
+    }
+
+    /// 重排序（同步）。`POST /managed-models/:id/rerank`。对应 TS `rerank`。
+    ///
+    /// `model_id` 须为重排序托管模型（`capabilities.supports_rerank=true`，上游接 DashScope）。
+    /// 统一扁平契约；响应 `{ results: [{ index, relevance_score, document? }], usage, model }`
+    /// （网关已把上游原生嵌套 / OpenAI 兼容扁平两线路归一化，无 `{code,data}` 包装）。
+    pub async fn rerank(
+        &self,
+        model_id: &str,
+        req: &RerankRequest,
+        signal: Option<CancellationToken>,
+    ) -> Result<RerankResponse> {
+        let endpoint = format!("/managed-models/{}/rerank", urlencode(model_id));
+        let body = serde_json::to_string(req)
+            .map_err(|e| Error::other(format!("serialize rerank request: {e}")))?;
+        let (bytes, _) = self
+            .do_json_full_raw(
+                reqwest::Method::POST,
+                &endpoint,
+                Some(&body),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| Error::other(format!("{endpoint}: decode: {e}")))
+    }
+
+    // ===========================================================================
     // 媒体生成（v1.3+）—— 图片 / 视频生成托管模型（与 chat 同网关）
     // ===========================================================================
 
@@ -2441,6 +2496,98 @@ mod p4_tests {
             .await
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn embedding_rerank_request_serialization() {
+        // EmbeddingInput untagged: Single → 裸字符串, Batch → 数组; 可选字段缺省不出现。
+        let single = EmbeddingRequest {
+            input: crate::models::types::EmbeddingInput::Single("hello".into()),
+            dimensions: Some(512),
+            encoding_format: None,
+        };
+        let v = serde_json::to_value(&single).unwrap();
+        assert_eq!(v["input"], serde_json::json!("hello"));
+        assert_eq!(v["dimensions"], serde_json::json!(512));
+        assert!(v.get("encoding_format").is_none());
+
+        let batch = EmbeddingRequest {
+            input: crate::models::types::EmbeddingInput::Batch(vec!["a".into(), "b".into()]),
+            dimensions: None,
+            encoding_format: None,
+        };
+        let vb = serde_json::to_value(&batch).unwrap();
+        assert_eq!(vb["input"], serde_json::json!(["a", "b"]));
+        assert!(vb.get("dimensions").is_none());
+
+        let rr = RerankRequest {
+            query: "q".into(),
+            documents: vec!["d0".into(), "d1".into()],
+            top_n: Some(2),
+            return_documents: Some(true),
+            instruct: None,
+        };
+        let vr = serde_json::to_value(&rr).unwrap();
+        assert_eq!(vr["query"], serde_json::json!("q"));
+        assert_eq!(vr["documents"], serde_json::json!(["d0", "d1"]));
+        assert_eq!(vr["top_n"], serde_json::json!(2));
+        assert_eq!(vr["return_documents"], serde_json::json!(true));
+        assert!(vr.get("instruct").is_none());
+    }
+
+    #[tokio::test]
+    async fn embeddings_posts_and_parses_openai_response() {
+        let body = r#"{"object":"list","model":"text-embedding-v4","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"usage":{"prompt_tokens":5,"total_tokens":5}}"#;
+        let (base, log, _) = spawn_mock(vec![MockResponse::ok(body)]).await;
+        let client = primed_client(&base);
+
+        let req = EmbeddingRequest {
+            input: crate::models::types::EmbeddingInput::Single("hello".into()),
+            dimensions: Some(512),
+            encoding_format: None,
+        };
+        let resp = client.embeddings("text-embedding-v4", &req, None).await.unwrap();
+
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].contains("POST") && recorded[0].contains("/managed-models/text-embedding-v4/embeddings"),
+            "unexpected request line: {}",
+            recorded[0]
+        );
+        assert_eq!(resp.model, "text-embedding-v4");
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(resp.usage.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn rerank_posts_and_parses_normalized_response() {
+        let body = r#"{"results":[{"index":1,"relevance_score":0.93,"document":"doc1"},{"index":0,"relevance_score":0.42,"document":"doc0"}],"usage":{"total_tokens":79},"model":"gte-rerank-v2"}"#;
+        let (base, log, _) = spawn_mock(vec![MockResponse::ok(body)]).await;
+        let client = primed_client(&base);
+
+        let req = RerankRequest {
+            query: "q".into(),
+            documents: vec!["doc0".into(), "doc1".into()],
+            top_n: Some(2),
+            return_documents: Some(true),
+            instruct: None,
+        };
+        let resp = client.rerank("gte-rerank-v2", &req, None).await.unwrap();
+
+        let recorded = log.lock().unwrap().clone();
+        assert!(
+            recorded[0].contains("POST") && recorded[0].contains("/managed-models/gte-rerank-v2/rerank"),
+            "unexpected request line: {}",
+            recorded[0]
+        );
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].index, 1);
+        assert!((resp.results[0].relevance_score - 0.93).abs() < 1e-9);
+        assert_eq!(resp.results[0].document.as_deref(), Some("doc1"));
+        assert_eq!(resp.usage.total_tokens, 79);
+        assert_eq!(resp.model.as_deref(), Some("gte-rerank-v2"));
     }
 
     #[tokio::test]

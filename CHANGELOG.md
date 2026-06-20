@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [2.9.0] - 2026-06-20 — 向量 (Embedding) + 重排序 (Rerank) 端点
+
+托管模型网关新增向量与重排序两类模型（上游接阿里云百炼 DashScope），SDK 订阅会员可经现有会员计费体系（Hold→Settle→Release，按 `total_tokens` 套 input 费率）直接调用。具体上游模型名（`text-embedding-v4` / `gte-rerank-v2` / `qwen3-rerank` 等）由管理员在托管模型后台自填，不在 SDK / 网关硬编码。与 `@acosmi/sdk-ts` v2.9.0 同步。
+
+### Added
+
+- **`Client::embeddings(model_id, &EmbeddingRequest, signal)`** — 向量（同步，`POST /managed-models/:id/embeddings`）：请求 `{ input, dimensions?, encoding_format? }`（`input` = `EmbeddingInput::Single | Batch`），响应为 OpenAI `/v1/embeddings` 标准（`EmbeddingResponse`，网关直通无包装）。仅 `capabilities.supports_embedding=true` 的模型可用。
+- **`Client::rerank(model_id, &RerankRequest, signal)`** — 重排序（同步，`POST /managed-models/:id/rerank`）：统一扁平契约 `{ query, documents, top_n?, return_documents?, instruct? }`，响应 `RerankResponse { results: [{ index, relevance_score, document? }], usage, model }`（网关已归一化原生嵌套 / OpenAI 兼容扁平两线路）。仅 `capabilities.supports_rerank=true` 的模型可用。
+- **类型** — `EmbeddingInput`/`EmbeddingRequest`/`EmbeddingData`/`EmbeddingUsage`/`EmbeddingResponse`/`RerankRequest`/`RerankResult`/`RerankResponse`（crate 根 re-export）。
+
 ## [2.8.0] - 2026-06-19 — Rust SDK 首版（端口自 sdk-ts v2.8.0）
 
 Acosmi Rust SDK 首个发布版本，从事实标准主实现 `@acosmi/sdk-ts` v2.8.0 全量端口。

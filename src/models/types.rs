@@ -65,6 +65,14 @@ pub struct ModelCapabilities {
     /// 视频生成能力（v1.3+）。应通过 `generate_video()` + `poll_video_task()` 调用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_video_generation: Option<bool>,
+
+    /// 向量能力（v2.9+）。应通过 `embeddings()` 调用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_embedding: Option<bool>,
+
+    /// 重排序能力（v2.9+）。应通过 `rerank()` 调用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_rerank: Option<bool>,
 }
 
 /// 图片生成请求（`generate_image`）。
@@ -119,6 +127,111 @@ pub struct VideoTaskResponse {
     pub error: Option<String>,
     #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+}
+
+// ── 向量 (Embedding) / 重排序 (Rerank) (v2.9.0) ──────────────────────────────
+// SDK 订阅会员经 POST /managed-models/:id/{embeddings,rerank} 调用; 仅
+// capabilities.supports_embedding / supports_rerank 的托管模型可用。上游接 DashScope。
+
+/// 向量输入：单条文本或文本数组（对外 = OpenAI `input` 字段）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    /// 单条文本。
+    Single(String),
+    /// 批量文本。
+    Batch(Vec<String>),
+}
+
+/// 向量请求（`embeddings`）。对外 = OpenAI `/v1/embeddings` 标准。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    /// 待向量化的文本（单条）或文本数组（批量）。
+    pub input: EmbeddingInput,
+    /// 向量维度（可选；DashScope text-embedding-v4 支持 2048/1536/1024/768/512/256/128/64）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<i64>,
+    /// 编码格式（可选，如 `"float"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+}
+
+/// 单条向量结果（OpenAI 标准）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    #[serde(default)]
+    pub object: String,
+    #[serde(default)]
+    pub index: i64,
+    #[serde(default)]
+    pub embedding: Vec<f64>,
+}
+
+/// 向量 / 重排序用量。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub total_tokens: i64,
+}
+
+/// 向量响应（OpenAI `/v1/embeddings` 标准）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    #[serde(default)]
+    pub object: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub data: Vec<EmbeddingData>,
+    #[serde(default)]
+    pub usage: EmbeddingUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// 重排序请求（`rerank`）。统一扁平契约，网关内部按模型线路转换。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankRequest {
+    /// 查询文本。
+    pub query: String,
+    /// 候选文档列表。
+    pub documents: Vec<String>,
+    /// 返回前 N 条（可选；缺省返回全部）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<i64>,
+    /// 是否在结果中回传文档原文（可选，缺省 false）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_documents: Option<bool>,
+    /// 排序指令（可选；仅 OpenAI 兼容线路支持，原生线路忽略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruct: Option<String>,
+}
+
+/// 单条重排序结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RerankResult {
+    /// 文档在原 `documents` 数组中的下标。
+    #[serde(default)]
+    pub index: i64,
+    /// 相关性得分（越高越相关）。
+    #[serde(default)]
+    pub relevance_score: f64,
+    /// 文档原文（仅 `return_documents=true` 时存在）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+}
+
+/// 重排序响应。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RerankResponse {
+    #[serde(default)]
+    pub results: Vec<RerankResult>,
+    #[serde(default)]
+    pub usage: EmbeddingUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// 模型可接收的用户输入模态（v1.2+）。闭 union。
