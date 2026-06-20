@@ -6,7 +6,7 @@
 //! **双平面 wire（契约 §12）**：
 //!   - **请求体字段 = snake_case**（app_id / workspace_id / config_json / secret_kind / new_plaintext ...）；
 //!   - **响应 data = model 直接序列化的 camelCase**（appId / credentialRef / secretKind ...，
-//!     与本域 [`types`] 逐字一致）。
+//!     与本域 [`types`](super::types) 逐字一致）。
 //!     出站请求体经本模块手工映射 camelCase 入参 → snake_case wire。
 //!
 //! **安全红线（契约 §6 Secret zero-knowledge）**：

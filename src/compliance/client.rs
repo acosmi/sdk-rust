@@ -1133,6 +1133,16 @@ impl ComplianceClient {
 
 impl Client {
     /// SDK-facing compliance 域子客户端。对应 TS `client.compliance` getter。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use acosmi::Client;
+    /// # async fn demo(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let cc = client.compliance();
+    /// let stats = cc.get_tsa_stats(None).await?; // TSA 只读统计视图
+    /// # let _ = stats; Ok(()) }
+    /// ```
     pub fn compliance(&self) -> ComplianceClient {
         ComplianceClient::new(self.clone())
     }

@@ -4,8 +4,8 @@
 //! Compliance（电子证据、时间章、报告、签署 envelope）统一客户端。
 //!
 //! 端口自 [`acosmi-sdk-ts`](https://github.com/acosmi/sdk-ts) v2.8.0（事实标准主实现）。
-//! 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见父仓
-//! `docs/jihua/sdk-rust-port-plan-2026-06-19.md`。
+//! 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
+//! `docs/开发与发布手册.md` §5。
 //!
 //! ## 双格式红线
 //!

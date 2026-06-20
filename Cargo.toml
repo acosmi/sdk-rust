@@ -15,7 +15,7 @@ readme = "README.md"
 name = "acosmi"
 path = "src/lib.rs"
 
-# 跨语言契约（见 docs/开发与发布手册.md §5 与父仓 docs/jihua/sdk-rust-port-plan-2026-06-19.md）：
+# 跨语言契约（见 docs/开发与发布手册.md §5）：
 #   - snake_case wire-format 字段名（serde 结构体字段即 wire 契约）
 #   - 符号名跨语言一致（类型/错误名 PascalCase；方法 snake_case 为 Rust 惯例偏移）
 #   - bug-for-bug：retry POST 默认 false / 流式不重试防双扣 / sanitize thinking 硬豁免 / 401 单次重试

@@ -2,7 +2,7 @@
 //!
 //! 对齐 `chatbridge/index.ts`。暴露 read-only metadata + ChannelEvent types + 7 平台/区域/状态
 //! 枚举与 type guards + [`ChatBridgeClient`]（integration/credential 管理面 CRUD；经
-//! [`Client::chat_bridge`] getter 子客户端访问）。
+//! [`crate::Client::chat_bridge`] getter 子客户端访问）。
 //!
 //! **安全红线（secret 零导出）**：平台 secret（plaintext / token / signing key）永不出现在本
 //! barrel 导出 —— `store_credential` / `rotate_credential` 的明文只进请求体一次（仅

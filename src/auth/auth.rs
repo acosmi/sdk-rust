@@ -250,6 +250,17 @@ pub fn generate_state() -> String {
 }
 
 /// S256 code_challenge：SHA-256(verifier) → base64url 无填充。
+///
+/// # Examples
+///
+/// ```
+/// use acosmi::{generate_code_verifier, code_challenge};
+///
+/// let verifier = generate_code_verifier();
+/// let challenge = code_challenge(&verifier);
+/// assert!(!challenge.is_empty());
+/// assert_eq!(code_challenge(&verifier), challenge); // 同 verifier 确定性
+/// ```
 pub fn code_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     base64url_no_pad(&digest)

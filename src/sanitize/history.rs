@@ -127,6 +127,16 @@ fn filter_blocks(
 /// 标记。理由：Anthropic extended thinking + tool_use 续轮场景下，上游强制要求 assistant 历史中
 /// 保留原始 thinking 块，否则返回 "The content[].thinking in the thinking mode must be passed
 /// back to the API."。本豁免兜底历史会话与第三方调用方两类已污染场景。
+///
+/// # Examples
+///
+/// ```
+/// use acosmi::sanitize::strip_ephemeral;
+///
+/// // 空历史 → 空结果（无 ephemeral 块可剥）。类型由参数推断为 Vec<serde_json::Value>。
+/// let cleaned = strip_ephemeral(Vec::new());
+/// assert!(cleaned.is_empty());
+/// ```
 pub fn strip_ephemeral(messages: Vec<Value>) -> Vec<Value> {
     drop_blocks(messages, &|block| {
         match block.get("type").and_then(Value::as_str) {

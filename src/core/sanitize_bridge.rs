@@ -7,7 +7,7 @@
 //! [`Client::set_auto_strip_ephemeral_history`]）。
 //!
 //! 调用时机：`build_chat_request` 开头（每次 chat/chat_stream/chat_messages*）。
-//! 未配置时零开销（[`Client::apply_request_sanitizers`] 首行 early-return）。
+//! 未配置时零开销（`Client::apply_request_sanitizers`（内部）首行 early-return）。
 //!
 //! feature `sanitize` 门控（默认开）。
 

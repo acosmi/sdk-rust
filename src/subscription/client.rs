@@ -50,7 +50,7 @@ impl Client {
     /// 订阅支付前绑定硬闸。对应 TS `subscriptionPrecheck`。
     ///
     /// 返回 `{ok:true}` 表示已绑定手机/邮箱可放行支付；未绑定时网关返回 HTTP 403 + 业务码
-    /// 41001（[`Error::Http`] / [`Error::Business`]），调用方据此引导用户先绑定联系方式。
+    /// 41001（[`crate::Error::Http`] / [`crate::Error::Business`]），调用方据此引导用户先绑定联系方式。
     pub async fn subscription_precheck(
         &self,
         signal: Option<CancellationToken>,

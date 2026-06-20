@@ -247,7 +247,7 @@ impl Default for AgentRunWithLocalToolsOptions {
 
 /// SSE 事件 union（扁平判别符 enum，恰镜像 TS discriminated union）。对应 TS `AgentRunStreamEvent`。
 ///
-/// 🔴 未知 type 在 [`parse_agent_run_event`] 中映射为 [`AgentRunStreamEvent::Error`]
+/// 🔴 未知 type 在内部 SSE 流解析器中映射为 [`AgentRunStreamEvent::Error`]
 /// （`code="unknown_event"`），**注入流不丢**。
 #[derive(Debug, Clone)]
 pub enum AgentRunStreamEvent {

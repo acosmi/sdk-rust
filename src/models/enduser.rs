@@ -11,6 +11,16 @@ pub const MAX_END_USER_ID_LENGTH: usize = 512;
 /// 空串/`None` 视为合法（表示未设置），返回 `None`。
 ///
 /// 返回 `Some(错误信息)` 或 `None` 表示合法。
+///
+/// # Examples
+///
+/// ```
+/// use acosmi::validate_end_user_id;
+///
+/// assert!(validate_end_user_id(Some("user-abc-123")).is_none()); // 合法
+/// assert!(validate_end_user_id(Some("has space")).is_some());     // 非法字符
+/// assert!(validate_end_user_id(None).is_none());                  // 未设置 = 合法
+/// ```
 pub fn validate_end_user_id(s: Option<&str>) -> Option<String> {
     let s = match s {
         Some(s) if !s.is_empty() => s,

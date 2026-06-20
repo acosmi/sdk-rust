@@ -563,6 +563,27 @@ impl AgentRunsClient {
 
 impl Client {
     /// SDK-facing cloud agent run gateway。对应 TS `client.agentRuns` getter。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use acosmi::Client;
+    /// # use acosmi::agent_runs::AgentRunCreateRequest;
+    /// # async fn demo(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let runs = client.agent_runs();
+    /// let run = runs
+    ///     .create(
+    ///         &AgentRunCreateRequest {
+    ///             app_id: "crabdesign".into(),
+    ///             input: "Create a landing page mockup".into(),
+    ///             ..Default::default()
+    ///         },
+    ///         None,
+    ///     )
+    ///     .await?;
+    /// println!("run_id = {}", run.run_id);
+    /// # Ok(()) }
+    /// ```
     pub fn agent_runs(&self) -> AgentRunsClient {
         AgentRunsClient::new(self.clone())
     }

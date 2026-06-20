@@ -5,7 +5,7 @@
 //!
 //! 设计纪律（安全红线）：
 //!   - chatbridge 资源 **响应 data = camelCase**（与 model/chat_bridge.go json tag 逐字一致）；
-//!     **请求体 = snake_case**（handler ShouldBindJSON tag），两平面在 [`client`] 手工映射；
+//!     **请求体 = snake_case**（handler ShouldBindJSON tag），两平面在 [`client`](super::client) 手工映射；
 //!   - 平台 secret（plaintext / token / signing key）**永不出现在 SDK 公共导出**；
 //!     SDK 只见 read-only metadata + [`CredentialRef`] + fingerprint + ChannelEvents；
 //!   - 7 个平台严格枚举（闭 union）；

@@ -170,6 +170,19 @@ pub struct Client {
 
 impl Client {
     /// 同步构造（对应 TS constructor）。校验并归一化 URL；不预载 token（见 [`Client::create`]）。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acosmi::{Client, Config};
+    ///
+    /// let client = Client::new(Config {
+    ///     server_url: Some("https://acosmi.com".into()),
+    ///     ..Default::default()
+    /// })
+    /// .unwrap();
+    /// assert_eq!(client.base_url(), "https://acosmi.com");
+    /// ```
     pub fn new(cfg: Config) -> Result<Self> {
         let server_url = match &cfg.server_url {
             Some(s) => normalize_gateway_base_url(s)?,
@@ -1393,6 +1406,22 @@ impl Client {
     /// 响应的 `token_remaining` / `call_remaining` / `model_token_remaining*` 来自服务端响应头
     /// （反映结算后余额）；缺失保持 [`ChatResponse`] 默认哨兵。v0.5.0 按 provider 路由
     /// `/anthropic` 或 `/chat`。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use acosmi::Client;
+    /// # use acosmi::models::{ChatRequest, ChatMessage};
+    /// # async fn demo(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// let req = ChatRequest {
+    ///     messages: Some(vec![ChatMessage { role: "user".into(), content: "Hi".into() }]),
+    ///     max_tokens: Some(256),
+    ///     ..Default::default()
+    /// };
+    /// let resp = client.chat("claude-opus-4-7", &req, None).await?;
+    /// println!("{:?}", resp.content);
+    /// # Ok(()) }
+    /// ```
     pub async fn chat(
         &self,
         model_id: &str,
@@ -1647,7 +1676,7 @@ impl Client {
 
     /// 流式聊天（SSE），返回 `impl Stream<Item = Result<StreamEvent>>`。对应 TS `chatStream`。
     ///
-    /// **🔴 计费安全红线**：流式路径**只走单次 [`Self::do_request`]，绝不经 retry 包装**——
+    /// **🔴 计费安全红线**：流式路径**只走单次 `do_request`（内部），绝不经 retry 包装**——
     /// SSE 一旦部分写出，重试 = 双 token + 重复消息 = 双扣。401 仅做一次 force_refresh 重试
     /// （`retried` guard 防递归）。`signal` 经 `select!` 接入 SSE 读循环。
     pub fn chat_stream(
@@ -2125,6 +2154,18 @@ fn default_store() -> Arc<dyn TokenStore> {
 
 /// 归一化网关 base URL：仅许 http/https；拒空 / 拒 query / 拒 fragment / 拒非法 URL；
 /// 去尾随 `/`，返回 `scheme://host[:port]/path`。
+///
+/// # Examples
+///
+/// ```
+/// use acosmi::core::normalize_gateway_base_url;
+///
+/// assert_eq!(
+///     normalize_gateway_base_url("https://gw.example/api/v4/").unwrap(),
+///     "https://gw.example/api/v4",
+/// );
+/// assert!(normalize_gateway_base_url("wss://session.example").is_err()); // 仅 http/https
+/// ```
 pub fn normalize_gateway_base_url(input: &str) -> Result<String> {
     normalize_base(input, "serverURL")
 }

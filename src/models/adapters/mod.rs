@@ -114,6 +114,15 @@ pub fn get_adapter(provider: &str) -> Adapter {
 ///
 /// 格式一致性护栏：`preferred_format` 仅在确被 `supported_formats` 收录时才采信，
 /// 防止上游元数据漂移把 SDK 路由到模型并不支持的格式端点。
+///
+/// # Examples
+///
+/// ```
+/// use acosmi::{get_adapter_for_model, Adapter, ManagedModel};
+///
+/// let m = ManagedModel { preferred_format: Some("openai".into()), ..Default::default() };
+/// assert_eq!(get_adapter_for_model(&m), Adapter::OpenAI);
+/// ```
 pub fn get_adapter_for_model(m: &ManagedModel) -> Adapter {
     let mut has_anthropic = false;
     let mut has_openai = false;
