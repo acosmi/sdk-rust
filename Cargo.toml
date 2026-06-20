@@ -1,0 +1,55 @@
+[package]
+name = "acosmi-sdk"
+version = "2.10.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Acosmi Rust SDK：模型网关、Agent Run Gateway 与 Compliance 统一客户端。双格式（Anthropic + OpenAI）。端口自 acosmi-sdk-ts。"
+license = "MIT"
+repository = "https://github.com/acosmi/sdk-rust"
+authors = ["Acosmi"]
+keywords = ["acosmi", "anthropic", "openai", "llm", "sdk"]
+categories = ["api-bindings", "asynchronous"]
+readme = "README.md"
+
+[lib]
+name = "acosmi"
+path = "src/lib.rs"
+
+# 跨语言契约（见 docs/开发与发布手册.md §5）：
+#   - snake_case wire-format 字段名（serde 结构体字段即 wire 契约）
+#   - 符号名跨语言一致（类型/错误名 PascalCase；方法 snake_case 为 Rust 惯例偏移）
+#   - bug-for-bug：retry POST 默认 false / 流式不重试防双扣 / sanitize thinking 硬豁免 / 401 单次重试
+#   - 双 adapter（Anthropic + OpenAI）等地位红线，恒编译，不 feature-gate
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+tokio-util = "0.7"
+url = "2"
+bytes = "1"
+# chrono：ISO 8601 / RFC3339 解析（token_set_is_expired 过期判断 + new_token_set 时间戳）。
+# 关 default（去掉 oldtime/wasmbind 等无关项），仅留 std + clock（Utc::now）。
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# PKCE：S256 challenge = SHA-256(verifier) → base64url 无填充；verifier/state = OS 随机 32B。
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+# notifications WebSocket：长连接（对齐 Go gorilla/websocket）。与 reqwest 同 rustls backend
+# （webpki-roots，无 native-tls），仅这一个 WS dep。futures-util 用于 SinkExt/StreamExt（split + send）。
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+# sanitize：历史消息清洗子包（对齐 npm 子路径 ./sanitize），默认开启以保证 lib 完整。
+default = ["sanitize"]
+sanitize = []
+# desktop-loopback：authorize() 的 loopback HTTP server（桌面 OAuth），按需开启。
+desktop-loopback = []
