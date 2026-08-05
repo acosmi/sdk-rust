@@ -49,7 +49,7 @@ fn unwrap_bare_or_enveloped<T: serde::de::DeserializeOwned>(raw: Value, op: &str
         }
     }
     Err(Error::other(format!(
-        "acosmi: {op}: gateway accepted the request but the response is missing required fields          (observed keys: {})",
+        "acosmi: {op}: gateway accepted the request but the response is missing required fields (observed keys: {})",
         observed_keys()
     )))
 }
