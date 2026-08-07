@@ -1567,6 +1567,12 @@ impl Client {
     ///
     /// 返回 `task_id`；用 [`Self::poll_video_task`] 轮询直到 `status=completed`。
     /// 上报真物理量（视频秒数）需在 `poll_video_task` 时回传 `duration`。
+    ///
+    /// 预算用 [`CHAT_REQUEST_TIMEOUT_MS`] 而非控制面默认值：这是生成端点，上游排队 +
+    /// 提交返回 `task_id` 本身就可能超过 30s。2026-08-06 前这里传的是
+    /// `DEFAULT_JSON_TIMEOUT_MS`，与同文件 `chat` / `embeddings` / `rerank` /
+    /// `generate_image` / `chat_messages` 五个兄弟不一致；同一处错误在 TS 与 Go 两个
+    /// 兄弟 SDK 上**同时**存在，故本文件底部加了结构闸门。
     pub async fn generate_video(
         &self,
         model_id: &str,
@@ -1582,7 +1588,7 @@ impl Client {
                 &endpoint,
                 Some(&body),
                 signal,
-                DEFAULT_JSON_TIMEOUT_MS,
+                CHAT_REQUEST_TIMEOUT_MS,
             )
             .await?;
         Self::unwrap_api_response(&endpoint, &bytes)

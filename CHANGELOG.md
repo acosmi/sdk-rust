@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [2.10.1] - 2026-08-06 — `generate_video` 的超时预算：生成端点不该继承控制面默认值
+
+`generate_video` 一直把 `DEFAULT_JSON_TIMEOUT_MS`（30s）传给 `do_json_full_raw`，而同文件的
+`chat` / `embeddings` / `rerank` / `generate_image` / `chat_messages` 五个兄弟传的都是
+`CHAT_REQUEST_TIMEOUT_MS`（11min）。视频生成是**生成端点**：上游排队 + 提交任务返回
+`task_id` 本身就可能超过 30 秒，超时后调用方拿到的是一个 timeout，而任务其实已经在上游建好了。
+
+这不是本仓一处笔误。**同一个错误在三个兄弟 SDK 的同一个方法上同时存在** —— TypeScript 的
+`generateVideo` 漏传 `doJSONFullRaw` 的第 5 实参，Go 的 `GenerateVideo` 干脆一个 deadline 都不设。
+三份独立实现犯同一个错，说明问题不在人而在形状：**控制面默认值对调用点是隐式的，谁都看不见
+自己继承了什么。** 相关根因见 `@acosmi/sdk-ts` 2.16.0 与 CrabCode 侧的
+`docs/audit/2026-08-06-qwen3.8-max流式中断-归属定案与修复方案.md`。
+
+### Fixed
+
+- **`Client::generate_video` 改传 `CHAT_REQUEST_TIMEOUT_MS`** —— 与同文件其余推理 / 生成端点
+  一致。`poll_video_task` 保持 `DEFAULT_JSON_TIMEOUT_MS` 不变：它是控制面 GET 轮询，不承载推理。
+
+### Added
+
+- **`core::client::timeout_budget_gate` 结构闸门（default-deny）** —— `do_json_full_raw` 的每个
+  调用点必须显式声明具名预算；要用控制面默认值必须进 `DEFAULT_TIMEOUT_ALLOWLIST` 并写明理由
+  （当前 2 项：`do_json_full` 通用包装器、`poll_video_task` 轮询）。附两条负向对照，防止扫描器
+  自己坏掉之后闸门恒绿 —— 恒绿的闸门比没有闸门更糟，因为它还提供虚假的安全感。
+
 ## [2.10.0] - 2026-06-20 — 多模态向量 / 重排序 (qwen3-vl-embedding / qwen3-vl-rerank)
 
 向量与重排序端点扩展为**多模态**（text / image / **video**），对接 DashScope `qwen3-vl-embedding`（多模态向量端点）与 `qwen3-vl-rerank`（原生 rerank 端点 + 多模态 content）。面向自建搜索引擎的图文 / 视频检索场景。计费口径不变（`total_tokens` 套 input 费率），上游模型名仍由管理员后台自填。与 `@acosmi/sdk-ts` v2.10.0 同步。

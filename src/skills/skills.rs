@@ -10,7 +10,7 @@ use crate::billing::entitlements::urlencoding;
 use crate::core::client::Client;
 use crate::core::http::{
     classify_transport, parse_http_error_with_retry_after, read_limited, read_limited_text,
-    MAX_DOWNLOAD_SIZE, MAX_ERROR_BODY_SIZE,
+    CHAT_REQUEST_TIMEOUT_MS, MAX_DOWNLOAD_SIZE, MAX_ERROR_BODY_SIZE,
 };
 use crate::shared::{ApiResponse, Error, Result};
 use tokio_util::sync::CancellationToken;
@@ -320,7 +320,12 @@ impl Client {
     ) -> Result<GenerateSkillResult> {
         let body = serde_json::to_string(req)
             .map_err(|e| Error::other(format!("serialize generate request: {e}")))?;
-        self.billing_post_body("/skill-generator/generate", Some(&body), signal)
+        self.billing_post_body_with_timeout(
+            "/skill-generator/generate",
+            Some(&body),
+            signal,
+            CHAT_REQUEST_TIMEOUT_MS,
+        )
             .await
     }
 
@@ -332,7 +337,12 @@ impl Client {
     ) -> Result<OptimizeSkillResult> {
         let body = serde_json::to_string(req)
             .map_err(|e| Error::other(format!("serialize optimize request: {e}")))?;
-        self.billing_post_body("/skill-generator/optimize", Some(&body), signal)
+        self.billing_post_body_with_timeout(
+            "/skill-generator/optimize",
+            Some(&body),
+            signal,
+            CHAT_REQUEST_TIMEOUT_MS,
+        )
             .await
     }
 
@@ -344,7 +354,12 @@ impl Client {
     ) -> Result<()> {
         let body = serde_json::json!({ "skillName": skill_name }).to_string();
         let _: serde_json::Value = self
-            .billing_post_body("/skill-generator/validate", Some(&body), signal)
+            .billing_post_body_with_timeout(
+                "/skill-generator/validate",
+                Some(&body),
+                signal,
+                CHAT_REQUEST_TIMEOUT_MS,
+            )
             .await?;
         Ok(())
     }

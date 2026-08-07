@@ -45,6 +45,10 @@ impl Client {
     }
 
     /// 计费域内部：POST `{api}{path}`（可选 JSON body）→ `ApiResponse<T>` 解包 → `data`。
+    ///
+    /// 用控制面默认预算（30s）。**LLM 支撑的端点不要走这里** —— 用
+    /// [`Self::billing_post_body_with_timeout`] 显式声明预算；`/skill-generator/*`
+    /// 服务端用的是 120s 的 LLM 客户端，封在 30s 会内外倒挂、客户端必先死。
     pub(crate) async fn billing_post_body<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -52,14 +56,24 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         // 计费域默认 30s JSON 超时（与 do_json_full 同口径）；POST 默认不重试（计费安全）。
+        self.billing_post_body_with_timeout(path, body, signal, DEFAULT_JSON_TIMEOUT_MS)
+            .await
+    }
+
+    /// 同 [`Self::billing_post_body`]，但由调用方显式指定超时预算。
+    ///
+    /// 存在的理由：计费域这条管道同时承载控制面写操作（订单 / 额度，30s 足够）和 LLM
+    /// 支撑的生成端点（`/skill-generator/*`，服务端 120s）。两者共用一个隐式默认值时，
+    /// 后者恒在服务端还没答完之前就被客户端砍掉。
+    pub(crate) async fn billing_post_body_with_timeout<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Option<&str>,
+        signal: Option<CancellationToken>,
+        timeout_ms: u64,
+    ) -> Result<T> {
         let (bytes, _) = self
-            .do_json_full_raw(
-                reqwest::Method::POST,
-                path,
-                body,
-                signal,
-                DEFAULT_JSON_TIMEOUT_MS,
-            )
+            .do_json_full_raw(reqwest::Method::POST, path, body, signal, timeout_ms)
             .await?;
         if bytes.is_empty() {
             return Err(Error::other(format!("{path}: empty response body")));
