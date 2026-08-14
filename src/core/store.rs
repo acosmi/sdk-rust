@@ -116,15 +116,20 @@ impl TokenStore for FileTokenStore {
         // 阻塞 fs（atomic rename + fsync）放进 blocking 线程池。
         tokio::task::spawn_blocking(move || -> Result<()> {
             use std::io::Write;
-            std::fs::create_dir_all(&dir)?;
+            create_private_dir(&dir)?;
             let tmp = dir.join(format!(
                 "tokens.json.tmp.{}.{}",
                 std::process::id(),
                 now_nanos()
             ));
             // 1) 写 tmp + fsync 文件内容。
+            //
+            // [2026-08-14 安全修复] 权限必须在**写入前**就位: 先 create 再 chmod 会留下一个
+            // "内容已落盘、权限仍是 umask 默认 (典型 0644)" 的窗口, 同机其他用户在那一瞬间
+            // 就能读到 refresh token。Unix 下用 OpenOptions::mode(0o600) 在 open(2) 的那一刻
+            // 定权限, 不留窗口。Go/TS 两套 store 早已是 0600, 此前只有 Rust 漏了。
             {
-                let mut fh = std::fs::File::create(&tmp)?;
+                let mut fh = create_private_file(&tmp)?;
                 fh.write_all(&data)?;
                 fh.sync_all()?; // fsync
             }
@@ -223,6 +228,44 @@ impl TokenStore for FileTokenStore {
 /// 创建文件 token 存储（与 Go `NewFileTokenStore` 等价）。
 pub fn new_file_token_store(path: Option<PathBuf>) -> FileTokenStore {
     FileTokenStore::new(path)
+}
+
+/// 创建仅属主可访问的目录（Unix 0700；Windows 依赖 ACL 继承，无 mode 概念）。
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// 创建仅属主可读写的文件（Unix 0600）。
+///
+/// 权限在 `open(2)` 时一次定死，而不是"先建后 chmod" —— 后者会留下一个内容已可读、权限还没收紧
+/// 的窗口，而这个文件里装的正是长期 refresh token。
+fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)
+    }
 }
 
 // ============================================================================

@@ -648,16 +648,22 @@ pub struct AuthorizeResult {
     pub redirect_uri: String,
 }
 
-/// 按 OAuth 2.1 PKCE 拼装授权 URL（loopback 桌面流程；不带 state，对齐 TS `authorize`）。
+/// 按 OAuth 2.1 PKCE 拼装授权 URL（loopback 桌面流程），**带 `state`**。
 ///
-/// 与浏览器 Web 流程的区别：桌面 loopback 不带 `state` 参数（本地回环天然防 CSRF），
-/// 走 `org_uuid` / `login_method` 等桌面专属参数。`#[cfg(feature = "desktop-loopback")]`
-/// 下的 `authorize` 用此 helper 构造 URL。
+/// 2026-08-14 起桌面流程同样发送并校验 `state`。此前不带的理由是"本地回环天然防 CSRF"，
+/// 但回环监听在整个流程期间对**本机任意进程**开放：一个本地恶意进程只要往
+/// `http://127.0.0.1:<port>/callback?code=<攻击者的授权码>` 打一枪，SDK 就会拿别人的授权码
+/// 去换 token，把用户会话接到攻击者账号上（login-CSRF）。端口随机但可枚举。
+/// 带上 32 字节随机 `state` 后，这一枪必须先猜中它。
+///
+/// 其余桌面专属参数（`org_uuid` / `login_method` 等）不变。
+/// `#[cfg(feature = "desktop-loopback")]` 下的 `authorize` 用此 helper 构造 URL。
 pub fn build_desktop_authorization_url(
     meta: &ServerMetadata,
     client_id: &str,
     redirect_uri: &str,
     challenge: &str,
+    state: &str,
     scopes: &[String],
     opts: &LoginOptions,
 ) -> Result<String> {
@@ -670,6 +676,7 @@ pub fn build_desktop_authorization_url(
         q.append_pair("response_type", "code");
         q.append_pair("code_challenge", challenge);
         q.append_pair("code_challenge_method", "S256");
+        q.append_pair("state", state);
         if !scopes.is_empty() {
             q.append_pair("scope", &scopes.join(" "));
         }
@@ -747,6 +754,8 @@ mod loopback {
 
         let verifier = generate_code_verifier();
         let challenge = code_challenge(&verifier);
+        // 桌面 loopback 的 CSRF 闸（见 build_desktop_authorization_url 文档）。
+        let state = generate_state();
 
         // 1) 启动本地 callback server（阻塞 listener 放 blocking 线程）。
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -763,6 +772,7 @@ mod loopback {
             client_id,
             &redirect_uri,
             &challenge,
+            &state,
             scopes,
             opts,
         )?;
@@ -793,15 +803,33 @@ mod loopback {
                 return Err(Error::other("authorize: unexpected callback path"));
             }
             let mut code: Option<String> = None;
+            let mut got_state = String::new();
             let mut err_desc = String::new();
             let mut err_code = String::new();
             for (k, v) in parsed.query_pairs() {
                 match k.as_ref() {
                     "code" => code = Some(v.to_string()),
+                    "state" => got_state = v.to_string(),
                     "error_description" => err_desc = v.to_string(),
                     "error" => err_code = v.to_string(),
                     _ => {}
                 }
+            }
+
+            // state 校验必须在消费 code **之前** —— 一旦返回 Ok(code)，调用方立刻拿它换 token。
+            if code.is_some() && got_state != state {
+                write_http(
+                    &mut stream,
+                    200,
+                    "text/html; charset=utf-8",
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权失败</title></head>\
+                     <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
+                     <h2>授权失败</h2><p>回调校验未通过, 已中止登录。</p>\
+                     <p style=\"color:#888;font-size:14px\">可以关闭此窗口。</p></body></html>",
+                );
+                return Err(Error::other(format!(
+                    "authorize: {ERR_STATE_MISMATCH}: callback state does not match pending state (possible CSRF)"
+                )));
             }
 
             match code {
@@ -989,6 +1017,7 @@ mod tests {
             "cid",
             "http://127.0.0.1:1234/callback",
             "CHAL",
+            "STATE123",
             &["ai".to_string(), "skills".to_string()],
             &opts,
         )
@@ -999,7 +1028,20 @@ mod tests {
         assert!(url.contains("scope=ai+skills"));
         assert!(url.contains("login_hint=a%40b.com"));
         assert!(url.contains("orgUUID=org1"));
-        // 桌面流程不带 state。
-        assert!(!url.contains("state="));
+        // 2026-08-14: 桌面流程**必须**带 state（此前钉死的是相反断言，见
+        // build_desktop_authorization_url 文档中的 login-CSRF 说明）。
+        assert!(url.contains("state=STATE123"));
+    }
+
+    #[test]
+    fn generate_state_is_random_and_url_safe() {
+        let a = generate_state();
+        let b = generate_state();
+        assert_ne!(a, b, "state 必须每次不同, 否则起不到 CSRF 防护作用");
+        // base64url 无填充: 32 字节 → 43 字符, 且只含 URL 安全字符。
+        assert_eq!(a.len(), 43);
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 }

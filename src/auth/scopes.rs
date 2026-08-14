@@ -42,6 +42,16 @@ pub const SCOPE_CHAT_BRIDGE_WRITE: &str = "chat_bridge:write";
 /// 轮换 / 吊销凭证（高风险）。
 pub const SCOPE_CHAT_BRIDGE_ROTATE: &str = "chat_bridge:rotate";
 
+// === 会员委托 Key 控制面 scope（高风险，不进 all_scopes）===
+
+/// 会员委托 Key 控制面 scope（2026-08-14 开放 API 方案）。
+///
+/// 高风险且**刻意不进** [`all_scopes`]：持有它即可签发"长期代表本人会员权益调用模型"的静态凭证，
+/// 桌面登录不应自动获得该能力 —— 调用方必须显式申请，用户才会在同意页看到这项授权。
+/// 服务端三条约束一起才闭合（见 Go `desktop_oauth.go`）：不并入任何分组展开、不得签进 sk- Key、
+/// 签发接口只接受有同意页的 desktop OAuth 或同源登录态。
+pub const SCOPE_AGENT_ACCESS_MANAGE: &str = "agent_access:manage";
+
 // === 旧细粒度 scope（deprecated，保留向后兼容；新代码请用分组 scope）===
 
 /// 旧细粒度 scope，保留向后兼容。
@@ -109,6 +119,11 @@ pub fn remote_control_scopes() -> Vec<String> {
 /// 调用方需显式申请，[`all_scopes`] 不含本项。
 pub fn chat_bridge_scopes() -> Vec<String> {
     vec![SCOPE_CHAT_BRIDGE.to_string()]
+}
+
+/// 会员委托 Key 控制面 scope（需显式申请；[`all_scopes`] 不含本项）。
+pub fn agent_access_scopes() -> Vec<String> {
+    vec![SCOPE_AGENT_ACCESS_MANAGE.to_string()]
 }
 
 #[cfg(test)]
