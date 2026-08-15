@@ -249,6 +249,19 @@ pub fn generate_state() -> String {
     random_base64url_32()
 }
 
+/// 桌面 loopback callback 的 state 判定（2026-08-15，与 TS/Go 同契约）：
+/// 恰好一个 state 且与本次登录严格相等，否则给出**只描述形态、不回显取值**的失败原因。
+/// 对 /callback 的一切形态（成功 / OAuth error / 畸形）先行——error 回调绕过 state 直接
+/// 结算 denied 会让本机任意进程零知识打断/塑形等待中的登录。
+fn callback_state_failure(states: &[String], want: &str) -> Option<&'static str> {
+    match states {
+        [] => Some("callback missing state"),
+        [only] if only == want => None,
+        [_] => Some("callback state does not match pending state"),
+        _ => Some("callback carried multiple state values"),
+    }
+}
+
 /// S256 code_challenge：SHA-256(verifier) → base64url 无填充。
 ///
 /// # Examples
@@ -803,21 +816,25 @@ mod loopback {
                 return Err(Error::other("authorize: unexpected callback path"));
             }
             let mut code: Option<String> = None;
-            let mut got_state = String::new();
+            let mut states: Vec<String> = Vec::new();
             let mut err_desc = String::new();
             let mut err_code = String::new();
             for (k, v) in parsed.query_pairs() {
                 match k.as_ref() {
                     "code" => code = Some(v.to_string()),
-                    "state" => got_state = v.to_string(),
+                    "state" => states.push(v.to_string()),
                     "error_description" => err_desc = v.to_string(),
                     "error" => err_code = v.to_string(),
                     _ => {}
                 }
             }
 
-            // state 校验必须在消费 code **之前** —— 一旦返回 Ok(code)，调用方立刻拿它换 token。
-            if code.is_some() && got_state != state {
+            // state 校验对 /callback 的**每一种**形态先行 —— 成功回调、OAuth error 回调、
+            // 畸形回调一视同仁, 且必须在消费 code / 结算 denied **之前**。否则本机任意进程
+            // 不猜 state 也能伪造一发 ?error=access_denied 把等待中的登录打成"用户已拒绝"。
+            // "恰好一个": 重复 state 参数不允许蒙混 (此前循环取末值), 缺失与错值同罪。
+            // 错误信息只描述形态, 不回显任何回调取值。
+            if let Some(reason) = callback_state_failure(&states, &state) {
                 write_http(
                     &mut stream,
                     200,
@@ -828,7 +845,7 @@ mod loopback {
                      <p style=\"color:#888;font-size:14px\">可以关闭此窗口。</p></body></html>",
                 );
                 return Err(Error::other(format!(
-                    "authorize: {ERR_STATE_MISMATCH}: callback state does not match pending state (possible CSRF)"
+                    "authorize: {ERR_STATE_MISMATCH}: {reason} (possible CSRF)"
                 )));
             }
 
@@ -1043,5 +1060,34 @@ mod tests {
         assert!(a
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    /// [2026-08-15] loopback callback state 判定矩阵 (与 TS/Go 同契约): 恰好一个且严格相等;
+    /// 缺失 / 重复 (含重复的正确值) / 错值一律拒绝, 且失败原因不回显取值。
+    #[test]
+    fn callback_state_failure_matrix() {
+        let want = "S-correct";
+        let s = |v: &str| v.to_string();
+
+        assert_eq!(callback_state_failure(&[s(want)], want), None, "唯一且相等 → 放行");
+        assert_eq!(
+            callback_state_failure(&[], want),
+            Some("callback missing state"),
+            "缺失 → 拒绝 (OAuth error 回调不带 state 同样走此路, 不得结算成 auth_denied)"
+        );
+        assert_eq!(
+            callback_state_failure(&[s("S-wrong")], want),
+            Some("callback state does not match pending state")
+        );
+        assert_eq!(
+            callback_state_failure(&[s(want), s("S-wrong")], want),
+            Some("callback carried multiple state values"),
+            "首值正确也不放行 —— 修复前循环取末值, 攻击者可用 ?state=<猜>&state=<junk> 蒙混"
+        );
+        assert_eq!(
+            callback_state_failure(&[s(want), s(want)], want),
+            Some("callback carried multiple state values"),
+            "重复的正确值也不是'恰好一个'"
+        );
     }
 }
