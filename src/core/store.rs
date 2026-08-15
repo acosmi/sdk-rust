@@ -235,7 +235,11 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+        {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
             Err(e) => return Err(e),

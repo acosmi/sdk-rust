@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 /// 允许在调用点使用控制面默认预算的方法，及其理由。
 const DEFAULT_TIMEOUT_ALLOWLIST: &[(&str, &str)] = &[
     ("do_json_full", "控制面通用包装器 —— 所有非推理端点走它"),
-    ("poll_video_task", "视频任务状态轮询 —— 控制面 GET，不承载推理"),
+    (
+        "poll_video_task",
+        "视频任务状态轮询 —— 控制面 GET，不承载推理",
+    ),
     (
         "billing_post_body",
         "计费域通用包装器 —— 订单 / 额度等控制面写操作；生成类调用走 _with_timeout 变体",
@@ -164,7 +167,11 @@ fn every_do_json_full_raw_call_declares_its_budget() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     src_files(&root, &mut files);
-    assert!(files.len() > 20, "只找到 {} 个源文件，疑似扫描器失效", files.len());
+    assert!(
+        files.len() > 20,
+        "只找到 {} 个源文件，疑似扫描器失效",
+        files.len()
+    );
 
     let mut total = 0usize;
     let mut bad = Vec::new();
@@ -320,7 +327,10 @@ fn gate_accepts_an_allowlisted_control_plane_call() {
     );
     let (seen, bad) = audit(synthetic, "synthetic.rs");
     assert_eq!(seen, 1);
-    assert!(bad.is_empty(), "allowlist 内的控制面调用不该被判违规：{bad:?}");
+    assert!(
+        bad.is_empty(),
+        "allowlist 内的控制面调用不该被判违规：{bad:?}"
+    );
 }
 
 #[test]

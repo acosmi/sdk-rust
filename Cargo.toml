@@ -1,6 +1,6 @@
 [package]
 name = "acosmi-sdk"
-version = "2.10.1"
+version = "2.17.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Acosmi Rust SDK：模型网关、Agent Run Gateway 与 Compliance 统一客户端。双格式（Anthropic + OpenAI）。端口自 acosmi-sdk-ts。"
@@ -52,4 +52,5 @@ tokio = { version = "1", features = ["full", "test-util"] }
 default = ["sanitize"]
 sanitize = []
 # desktop-loopback：authorize() 的 loopback HTTP server（桌面 OAuth），按需开启。
-desktop-loopback = []
+# 2026-08-15 起启用 tokio/net（常驻多连接 accept 循环）；feature 关闭时依赖面不变。
+desktop-loopback = ["tokio/net"]

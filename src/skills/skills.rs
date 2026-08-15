@@ -326,7 +326,7 @@ impl Client {
             signal,
             CHAT_REQUEST_TIMEOUT_MS,
         )
-            .await
+        .await
     }
 
     /// 优化已有技能定义。对应 TS `optimizeSkill`。
@@ -343,7 +343,7 @@ impl Client {
             signal,
             CHAT_REQUEST_TIMEOUT_MS,
         )
-            .await
+        .await
     }
 
     /// 校验技能定义正确性。对应 TS `validateSkill`。

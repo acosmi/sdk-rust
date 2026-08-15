@@ -253,6 +253,10 @@ pub fn generate_state() -> String {
 /// 恰好一个 state 且与本次登录严格相等，否则给出**只描述形态、不回显取值**的失败原因。
 /// 对 /callback 的一切形态（成功 / OAuth error / 畸形）先行——error 回调绕过 state 直接
 /// 结算 denied 会让本机任意进程零知识打断/塑形等待中的登录。
+///
+/// 门控与唯一消费者（`mod loopback`）一致 + `test`：否则 `--no-default-features` 构建下它是
+/// dead_code，CI 的 `RUSTFLAGS: -D warnings` 会据此报错（2026-08-15 实测，此前被 fmt 红挡住）。
+#[cfg(any(feature = "desktop-loopback", test))]
 fn callback_state_failure(states: &[String], want: &str) -> Option<&'static str> {
     match states {
         [] => Some("callback missing state"),
@@ -725,8 +729,15 @@ pub use loopback::authorize;
 #[cfg(feature = "desktop-loopback")]
 mod loopback {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+
+    /// 每连接请求头上限（8 KB，沿用旧实现读缓冲大小）；超限即静默丢弃该连接（不结算）。
+    const MAX_REQUEST_HEAD: usize = 8192;
+    /// 每连接读预算：慢/哑连接（端口探针、浏览器预测性预连接）最多占用一个后台任务这么久，
+    /// 不影响主 accept 循环（Node headersTimeout 的近似物，取更紧的 10s）。
+    const PER_CONN_READ_BUDGET: Duration = Duration::from_secs(10);
 
     /// HTML 转义（对应 TS `htmlEscape`）。
     fn html_escape(s: &str) -> String {
@@ -742,14 +753,19 @@ mod loopback {
     /// 1) 启动本地 127.0.0.1 HTTP server（随机端口）
     /// 2) 由调用方打开浏览器（`handler` 收到 `auth_url` 事件）—— 不引入 `open` dep，
     ///    SDK 只构造 URL 并发 `EVENT_AUTH_URL`；是否自动打开浏览器由调用方决定
-    /// 3) 接收 `/callback` 拿到 authorization code
-    /// 4) 返回 code + verifier 供后续 token 交换
+    /// 3) 常驻多连接 accept 循环接收回调（2026-08-15，对齐 TS 常驻 server / Go net/http）：
+    ///    非 /callback 路径（favicon、端口探针）→ 404 后继续等待；畸形请求 → 400 后继续等待；
+    ///    空/哑连接（浏览器预测性预连接）静默丢弃；只有 `/callback` 的三种终局形态
+    ///    （state 失败 / 用户拒绝 / 授权码）结算，且只取首发
+    /// 4) 返回 code + verifier 供后续 token 交换；成功 / 失败 / 取消一切终止路径都以
+    ///    监听端口关闭收尾（TS `server.close()+closeIdleConnections()` 的对应物）
     ///
-    /// 取消：传入的 `CancellationToken` 触发时返回超时错误。
+    /// 取消：传入的 `CancellationToken` 触发时返回超时错误，端口同步释放（旧实现把 listener
+    /// 交给 blocking 线程，取消后该线程永久卡在 `accept()` 上：端口活到进程退出或下一个连接
+    /// 被它吃掉，且 tokio runtime 关不掉——`Runtime::drop` 会一直等这个线程）。
     ///
     /// 注：TS 版在 `skip_browser=false` 时自动 spawn `open`/`xdg-open`/`rundll32`；Rust 原生
     /// 版**不内置浏览器拉起**（避免引新 dep），统一由调用方监听 `EVENT_AUTH_URL` 事件后自行打开。
-    /// 这是相位内的合理取舍（与方案 §4.3 "loopback 用 tiny_http + open" 的差异已记录）。
     #[allow(clippy::too_many_arguments)]
     pub async fn authorize(
         meta: &ServerMetadata,
@@ -770,8 +786,9 @@ mod loopback {
         // 桌面 loopback 的 CSRF 闸（见 build_desktop_authorization_url 文档）。
         let state = generate_state();
 
-        // 1) 启动本地 callback server（阻塞 listener 放 blocking 线程）。
+        // 1) 启动本地 callback server（异步 listener；结算/取消即 drop 释放端口）。
         let listener = TcpListener::bind("127.0.0.1:0")
+            .await
             .map_err(|e| Error::other(format!("authorize: bind loopback: {e}")))?;
         let port = listener
             .local_addr()
@@ -792,114 +809,40 @@ mod loopback {
         emit(LoginEvent::auth_url(auth_url.clone()));
 
         let success_redirect = resolve_success_redirect(opts.success_redirect_url.as_deref());
+        // 未传 signal = 一个永不触发的 token，收敛为单一 select 路径。
+        let cancel = signal.unwrap_or_default();
 
-        // 3) 在 blocking 线程上 accept 单个 callback 请求。
-        let accept = tokio::task::spawn_blocking(move || -> Result<String> {
-            // listener accept 单连接（OAuth callback 是单次跳转）。
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|e| Error::other(format!("authorize: accept: {e}")))?;
-            // 读请求行（"GET /callback?code=... HTTP/1.1"）。
-            let mut buf = [0u8; 8192];
-            let n = stream
-                .read(&mut buf)
-                .map_err(|e| Error::other(format!("authorize: read: {e}")))?;
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+        // 结算通道：容量 1 + try_send = 只取首发，后续回调（含洪泛）一律非阻塞丢弃
+        // （对齐 Go settleErr；TS 靠 promise 的 settle-once）。
+        let (tx, mut rx) = mpsc::channel::<Result<String>>(1);
 
-            // 解析 query。基址仅用于相对路径解析。
-            let full = format!("http://127.0.0.1{path}");
-            let parsed = url::Url::parse(&full)
-                .map_err(|e| Error::other(format!("authorize: parse callback url: {e}")))?;
-            if parsed.path() != "/callback" {
-                write_http(&mut stream, 404, "text/plain", "");
-                return Err(Error::other("authorize: unexpected callback path"));
-            }
-            let mut code: Option<String> = None;
-            let mut states: Vec<String> = Vec::new();
-            let mut err_desc = String::new();
-            let mut err_code = String::new();
-            for (k, v) in parsed.query_pairs() {
-                match k.as_ref() {
-                    "code" => code = Some(v.to_string()),
-                    "state" => states.push(v.to_string()),
-                    "error_description" => err_desc = v.to_string(),
-                    "error" => err_code = v.to_string(),
-                    _ => {}
-                }
-            }
-
-            // state 校验对 /callback 的**每一种**形态先行 —— 成功回调、OAuth error 回调、
-            // 畸形回调一视同仁, 且必须在消费 code / 结算 denied **之前**。否则本机任意进程
-            // 不猜 state 也能伪造一发 ?error=access_denied 把等待中的登录打成"用户已拒绝"。
-            // "恰好一个": 重复 state 参数不允许蒙混 (此前循环取末值), 缺失与错值同罪。
-            // 错误信息只描述形态, 不回显任何回调取值。
-            if let Some(reason) = callback_state_failure(&states, &state) {
-                write_http(
-                    &mut stream,
-                    200,
-                    "text/html; charset=utf-8",
-                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权失败</title></head>\
-                     <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
-                     <h2>授权失败</h2><p>回调校验未通过, 已中止登录。</p>\
-                     <p style=\"color:#888;font-size:14px\">可以关闭此窗口。</p></body></html>",
-                );
-                return Err(Error::other(format!(
-                    "authorize: {ERR_STATE_MISMATCH}: {reason} (possible CSRF)"
-                )));
-            }
-
-            match code {
-                Some(c) => {
-                    // 成功页：品牌 302 或本地 HTML。
-                    if let Some(redir) = &success_redirect {
-                        let resp = format!(
-                            "HTTP/1.1 302 Found\r\nLocation: {redir}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else {
-                        let html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权成功</title></head>\
-                            <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
-                            <h2>授权成功</h2><p>已完成身份认证, 请返回应用继续使用。</p>\
-                            <p style=\"color:#888;font-size:14px\">此窗口将在 3 秒后自动关闭…</p>\
-                            <script>setTimeout(function(){window.close()},3000)</script></body></html>";
-                        write_http(&mut stream, 200, "text/html; charset=utf-8", html);
-                    }
-                    Ok(c)
-                }
-                None => {
-                    let msg = if !err_desc.is_empty() {
-                        err_desc
-                    } else {
-                        err_code
-                    };
-                    let html = format!(
-                        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权失败</title></head>\
-                        <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
-                        <h2>授权失败</h2><p>{}</p>\
-                        <p style=\"color:#888;font-size:14px\">可以关闭此窗口。</p></body></html>",
-                        html_escape(&msg)
-                    );
-                    write_http(&mut stream, 200, "text/html; charset=utf-8", &html);
-                    Err(Error::other(format!("authorization denied: {msg}")))
-                }
-            }
-        });
-
-        // 4) race：callback vs 取消。
-        let code = if let Some(cancel) = signal {
+        // 3) 多连接 accept 循环。每个连接一个后台任务，慢连接不阻塞后续 accept。
+        let outcome: Result<String> = loop {
             tokio::select! {
-                res = accept => res
-                    .map_err(|e| Error::other(format!("authorize: join: {e}")))?,
-                _ = cancel.cancelled() => Err(Error::other("authorization timed out")),
+                settled = rx.recv() => {
+                    // tx 在本作用域始终存活，recv 不会返回 None；防御性兜底按超时处理。
+                    break settled.unwrap_or_else(|| Err(Error::other("authorization timed out")));
+                }
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_connection(
+                            stream,
+                            state.clone(),
+                            success_redirect.clone(),
+                            tx.clone(),
+                        ));
+                    }
+                    // accept 失败视为终局（与旧实现一致；loopback 上仅资源耗尽等罕见情形）。
+                    Err(e) => break Err(Error::other(format!("authorize: accept: {e}"))),
+                },
+                _ = cancel.cancelled() => break Err(Error::other("authorization timed out")),
             }
-        } else {
-            accept
-                .await
-                .map_err(|e| Error::other(format!("authorize: join: {e}")))?
         };
+        // 结算即停止接受新连接并释放端口。决定性响应在结算前已写完（见 handle_connection），
+        // 每个响应均 Connection: close + 写后 FIN，无 idle keep-alive 滞留。
+        drop(listener);
 
-        match code {
+        match outcome {
             Ok(c) => Ok((
                 AuthorizeResult {
                     code: c,
@@ -909,7 +852,11 @@ mod loopback {
             )),
             Err(e) => {
                 let msg = e.to_string();
-                let code = if msg.contains("denied") {
+                // 分类顺序对齐 TS：state_mismatch → denied → timed out → 兜底 token_exchange
+                // （旧实现漏 state_mismatch 分支，误报成 token_exchange）。
+                let code = if msg.contains(ERR_STATE_MISMATCH) {
+                    ERR_STATE_MISMATCH
+                } else if msg.contains("denied") {
                     ERR_AUTH_DENIED
                 } else if msg.contains("timed out") {
                     ERR_TIMEOUT
@@ -922,9 +869,142 @@ mod loopback {
         }
     }
 
-    fn write_http(stream: &mut std::net::TcpStream, status: u16, content_type: &str, body: &str) {
+    /// 单连接处理：读请求头 → 按路径分诊 → 写响应 → （仅 /callback 终局）结算。
+    /// 先写后结算：结算会让 `authorize` 返回并关闭 listener，先写完保证成功/失败页必达浏览器。
+    /// 非终局连接（探针/畸形/空连接）应答或丢弃后返回，登录继续等待。
+    async fn handle_connection(
+        mut stream: TcpStream,
+        state: String,
+        success_redirect: Option<String>,
+        tx: mpsc::Sender<Result<String>>,
+    ) {
+        // 读不出请求头（空连接、慢连接超预算、超 8KB、IO 错）→ 静默丢弃。
+        // Chrome 的预测性预连接就是"连上不发字节再断开"，绝不能当成回调处理。
+        let Some(head) = read_request_head(&mut stream).await else {
+            return;
+        };
+        let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+        // 解析 query。基址仅用于相对路径解析。
+        let full = format!("http://127.0.0.1{path}");
+        let Ok(parsed) = url::Url::parse(&full) else {
+            write_http(&mut stream, 400, "text/plain", "").await;
+            return;
+        };
+        if parsed.path() != "/callback" {
+            write_http(&mut stream, 404, "text/plain", "").await;
+            return;
+        }
+        let mut code: Option<String> = None;
+        let mut states: Vec<String> = Vec::new();
+        let mut err_desc = String::new();
+        let mut err_code = String::new();
+        for (k, v) in parsed.query_pairs() {
+            match k.as_ref() {
+                "code" => code = Some(v.to_string()),
+                "state" => states.push(v.to_string()),
+                "error_description" => err_desc = v.to_string(),
+                "error" => err_code = v.to_string(),
+                _ => {}
+            }
+        }
+
+        // state 校验对 /callback 的**每一种**形态先行 —— 成功回调、OAuth error 回调、
+        // 畸形回调一视同仁, 且必须在消费 code / 结算 denied **之前**。否则本机任意进程
+        // 不猜 state 也能伪造一发 ?error=access_denied 把等待中的登录打成"用户已拒绝"。
+        // "恰好一个": 重复 state 参数不允许蒙混 (此前循环取末值), 缺失与错值同罪。
+        // 错误信息只描述形态, 不回显任何回调取值。
+        if let Some(reason) = callback_state_failure(&states, &state) {
+            write_http(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权失败</title></head>\
+                 <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
+                 <h2>授权失败</h2><p>回调校验未通过, 已中止登录。</p>\
+                 <p style=\"color:#888;font-size:14px\">可以关闭此窗口。</p></body></html>",
+            )
+            .await;
+            let _ = tx.try_send(Err(Error::other(format!(
+                "authorize: {ERR_STATE_MISMATCH}: {reason} (possible CSRF)"
+            ))));
+            return;
+        }
+
+        match code {
+            Some(c) => {
+                // 成功页：品牌 302 或本地 HTML。
+                if let Some(redir) = &success_redirect {
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {redir}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                } else {
+                    let html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权成功</title></head>\
+                        <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
+                        <h2>授权成功</h2><p>已完成身份认证, 请返回应用继续使用。</p>\
+                        <p style=\"color:#888;font-size:14px\">此窗口将在 3 秒后自动关闭…</p>\
+                        <script>setTimeout(function(){window.close()},3000)</script></body></html>";
+                    write_http(&mut stream, 200, "text/html; charset=utf-8", html).await;
+                }
+                let _ = tx.try_send(Ok(c));
+            }
+            None => {
+                let msg = if !err_desc.is_empty() {
+                    err_desc
+                } else {
+                    err_code
+                };
+                let html = format!(
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>授权失败</title></head>\
+                    <body style=\"font-family:system-ui,sans-serif;text-align:center;padding:60px 20px\">\
+                    <h2>授权失败</h2><p>{}</p>\
+                    <p style=\"color:#888;font-size:14px\">可以关闭此窗口。</p></body></html>",
+                    html_escape(&msg)
+                );
+                write_http(&mut stream, 200, "text/html; charset=utf-8", &html).await;
+                let _ = tx.try_send(Err(Error::other(format!("authorization denied: {msg}"))));
+            }
+        }
+    }
+
+    /// 读满请求头（到 `\r\n\r\n` 或 EOF），8KB 上限 + 10s 预算。
+    /// 超限 / 超时 / IO 错 / 空连接 → `None`（调用方静默丢弃，不结算）。
+    /// 只消费请求头即可：OAuth 回调是 GET；POST body 不消费与 Node 行为一致。
+    async fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+        let fut = async {
+            let mut buf: Vec<u8> = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await.ok()?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() >= MAX_REQUEST_HEAD {
+                    return None;
+                }
+            }
+            if buf.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
+        };
+        tokio::time::timeout(PER_CONN_READ_BUDGET, fut)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
         let reason = match status {
             200 => "OK",
+            400 => "Bad Request",
             404 => "Not Found",
             _ => "OK",
         };
@@ -932,7 +1012,9 @@ mod loopback {
             "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.write_all(resp.as_bytes()).await;
+        // FIN：请求头已消费完毕，无 RST 截断响应之虞。
+        let _ = stream.shutdown().await;
     }
 }
 
@@ -1069,7 +1151,11 @@ mod tests {
         let want = "S-correct";
         let s = |v: &str| v.to_string();
 
-        assert_eq!(callback_state_failure(&[s(want)], want), None, "唯一且相等 → 放行");
+        assert_eq!(
+            callback_state_failure(&[s(want)], want),
+            None,
+            "唯一且相等 → 放行"
+        );
         assert_eq!(
             callback_state_failure(&[], want),
             Some("callback missing state"),

@@ -7,7 +7,7 @@
 
 ## 状态
 
-- 端口自 [`@acosmi/sdk-ts`](https://github.com/acosmi/sdk-ts)（事实标准主实现）。当前对齐 **v2.8.0**，18 业务域全覆盖。
+- 端口自 [`@acosmi/sdk-ts`](https://github.com/acosmi/sdk-ts)（事实标准主实现）。当前对齐 **v2.17.0**（桌面 loopback OAuth state 语义与 TS 2.17.0 同契约），18 业务域全覆盖。
 - 仅原生运行时（`tokio` + `reqwest`，rustls TLS）；不提供 WASM/浏览器并列构建。
 - 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 - API 参考由 `cargo doc` / [docs.rs](https://docs.rs/acosmi-sdk) 从 `///` 自动生成（Rust 生态惯例，无手写 API 目录）。
@@ -16,7 +16,7 @@
 
 ```toml
 [dependencies]
-acosmi-sdk = "2.8"
+acosmi-sdk = "2.17"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -31,7 +31,7 @@ use acosmi::{Client, Config};
 | feature | 默认 | 说明 |
 |---------|------|------|
 | `sanitize` | ✅ | 历史消息清洗子包（对齐 npm `./sanitize`） |
-| `desktop-loopback` | — | 桌面 OAuth 的 loopback HTTP server（`authorize()`） |
+| `desktop-loopback` | — | 桌面 OAuth 的 loopback HTTP server（`authorize()`；v2.17.0 起 state 全形态先行校验 + 常驻多连接回调服务） |
 
 ## 快速开始
 
@@ -491,7 +491,7 @@ cargo doc --no-deps        # 生成 docs.rs 同款 API 参考
 
 ## 更新历史
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前 **2.8.0**（Rust 首版，端口自 sdk-ts v2.8.0，18 域全覆盖）。
+见 [CHANGELOG.md](./CHANGELOG.md)。当前 **2.17.0**（端口自 sdk-ts v2.17.0 的桌面 loopback OAuth state 语义，18 域全覆盖；2.11–2.16 无 Rust 发布）。
 
 ## License
 

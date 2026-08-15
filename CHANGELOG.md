@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [2.17.0] - 2026-08-15 — 桌面 loopback OAuth：state 全形态闸 + 常驻多连接回调服务
+
+与 `@acosmi/sdk-ts` 2.17.0 的桌面 loopback state 语义同契约（跳号说明见文末）。本版是
+v2.10.0 之后首个 crates.io 发布：2.10.1 当时未打 tag、未发布，其内容随本版一并首发。
+
+### Security
+
+- **`authorize` 桌面 loopback 全形态先行校验 `state`** —— `/callback` 的成功 / OAuth error /
+  畸形回调一律先验「恰好一个且与本次登录严格相等」的 `state`，失败以 `state_mismatch` 结算，
+  错误信息只描述形态、不回显任何回调取值。堵住两类本机攻击：login-CSRF（拿攻击者授权码
+  接管会话）与 login-DoS/状态注入（零知识伪造 `?error=access_denied` 把登录打成「用户已拒绝」）。
+- **token 持久化文件权限收紧为 0600**（Unix，`FileTokenStore`）。
+
+### Fixed
+
+- **loopback 回调服务从「单 accept」升级为常驻多连接循环（对齐 TS 常驻 server / Go net/http）**
+  —— 旧实现只 accept 一个连接，任何抢先到达的连接（浏览器预测性预连接、favicon、端口探针、
+  畸形请求）都会直接打死等待中的登录。现在：非 `/callback` → 404 后继续等待；畸形请求 → 400
+  后继续等待；空/哑连接静默丢弃；只有 `/callback` 的三种终局形态（state 失败 / 用户拒绝 /
+  授权码）结算，且只取首发（容量 1 + 非阻塞 send，后续回调含洪泛一律丢弃，不二次结算）。
+- **取消不再泄漏 accept 线程与监听端口** —— 旧实现把 listener 交给 `spawn_blocking` 线程，取消
+  后该线程永久卡在 `accept()` 上：监听端口跟着它一起活着（直到有人连上来被它吃掉，或进程
+  退出），而且 **`Runtime::drop` 会一直等这个线程 —— 取消登录后关闭 runtime 会永久挂起**。
+  重写为 `tokio::net::TcpListener` 异步 accept 循环后，成功 / 失败 / 取消一切终止路径都以
+  监听端口立即关闭收尾（TS `server.close()+closeIdleConnections()` 的对应物；每个响应
+  `Connection: close` + 写后 FIN，无 idle keep-alive 滞留）。
+- **登录事件分类补 `state_mismatch` 分支** —— 此前 state 失败被误分类为
+  `token_exchange_failed` 事件；现按 TS 顺序 state_mismatch → denied → timed out →
+  token_exchange。
+- 亦含此前未单独发版的修复：bug-report 裸端点多套一层信封（对齐网关契约）；解包失败错误
+  消息中的连续空格。
+
+### Added
+
+- feature `desktop-loopback` 现启用 `tokio/net`（此前用 `std::net` + blocking 线程）；
+  不开启该 feature 时依赖面不变。
+- 集成测试 `tests/p2_auth_loopback_state.rs`：14 路矩阵（与 TS
+  `test/auth/desktop-loopback-state.test.ts` / Go `auth_loopback_state_test.go` 同契约，
+  另含多连接稳健性与「一切终止路径端口关闭」断言）。端口断言刻意单次不轮询：轮询探针本身
+  会满足旧实现里卡死的 `accept()`、从而放走线程并释放端口，把泄漏掩盖成绿色。
+
+> 版本号说明：2.11–2.16 无 Rust 发布；跳号至 2.17.0 对齐 `@acosmi/sdk-ts` 2.17.0 的
+> state 语义主线（版本号对齐策略见本文件头部与手册 §10），**不表示与 TS 2.11–2.17 的全部
+> 功能等同**。
+
 ## [2.10.1] - 2026-08-06 — `generate_video` 的超时预算：生成端点不该继承控制面默认值
 
 `generate_video` 一直把 `DEFAULT_JSON_TIMEOUT_MS`（30s）传给 `do_json_full_raw`，而同文件的
