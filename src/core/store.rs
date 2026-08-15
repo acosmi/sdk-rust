@@ -240,9 +240,11 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
             .mode(0o700)
             .create(dir)
         {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(e) => return Err(e),
+            // 该 cfg 块即函数尾表达式（另一支被 cfg 剔除），故不带 return —— 否则
+            // clippy::needless_return 在 Unix 上报错，而 Windows 主机编译不到这一支。
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
         }
     }
     #[cfg(not(unix))]
