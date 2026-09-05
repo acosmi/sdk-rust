@@ -212,26 +212,54 @@ pub fn iter_sse_lines_with_cap<S>(
 where
     S: Stream<Item = reqwest::Result<Bytes>>,
 {
+    iter_sse_lines_result_with_cap(body.map(|v| v.map_err(Into::into)), max_line_bytes)
+}
+
+pub(crate) fn iter_sse_lines_result<S>(body: S) -> impl Stream<Item = Result<String>>
+where
+    S: Stream<Item = Result<Bytes>>,
+{
+    iter_sse_lines_result_with_cap(body, MAX_SSE_LINE_SIZE)
+}
+
+fn iter_sse_lines_result_with_cap<S>(
+    body: S,
+    max_line_bytes: usize,
+) -> impl Stream<Item = Result<String>>
+where
+    S: Stream<Item = Result<Bytes>>,
+{
     try_stream! {
         futures::pin_mut!(body);
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
-            buf.extend_from_slice(&chunk);
-
-            // 按 \n 切行。
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let mut line: Vec<u8> = buf.drain(..=nl).collect();
-                line.pop(); // 去掉 \n
-                if line.last() == Some(&b'\r') {
-                    line.pop();
+            // Bound before copying, including complete lines contained in one chunk.
+            // One trailing CR is framing, and may be split from its LF.
+            let mut remaining = chunk.as_ref();
+            while !remaining.is_empty() {
+                let nl = remaining.iter().position(|&b| b == b'\n');
+                let end = nl.unwrap_or(remaining.len());
+                let part = &remaining[..end];
+                let trailing_cr = part.last().or_else(|| buf.last()) == Some(&b'\r');
+                let size = buf.len().checked_add(part.len())
+                    .ok_or_else(|| crate::shared::errors::Error::other("SSE line size overflow"))?;
+                let content_size = size.saturating_sub(usize::from(trailing_cr));
+                if content_size > max_line_bytes {
+                    Err(crate::shared::errors::Error::other(format!(
+                        "SSE line exceeds {max_line_bytes} bytes"
+                    )))?;
                 }
-                yield String::from_utf8_lossy(&line).into_owned();
-            }
-            if buf.len() > max_line_bytes {
-                Err(crate::shared::errors::Error::other(format!(
-                    "SSE line exceeds {max_line_bytes} bytes"
-                )))?;
+                buf.extend_from_slice(part);
+                if let Some(nl) = nl {
+                    if buf.last() == Some(&b'\r') { buf.pop(); }
+                    let line = String::from_utf8(std::mem::take(&mut buf))
+                        .map_err(|_| crate::shared::errors::Error::other("SSE line contains invalid UTF-8"))?;
+                    yield line;
+                    remaining = &remaining[nl + 1..];
+                } else {
+                    break;
+                }
             }
         }
         // 末行（无结尾 \n）。
@@ -240,7 +268,7 @@ where
                 buf.pop();
             }
             if !buf.is_empty() {
-                yield String::from_utf8_lossy(&buf).into_owned();
+                yield String::from_utf8(buf).map_err(|_| crate::shared::errors::Error::other("SSE line contains invalid UTF-8"))?;
             }
         }
     }
@@ -254,6 +282,13 @@ where
 pub async fn read_limited<S>(body: S, max_bytes: usize) -> Result<Vec<u8>>
 where
     S: Stream<Item = reqwest::Result<Bytes>>,
+{
+    read_limited_result(body.map(|v| v.map_err(Into::into)), max_bytes).await
+}
+
+pub(crate) async fn read_limited_result<S>(body: S, max_bytes: usize) -> Result<Vec<u8>>
+where
+    S: Stream<Item = Result<Bytes>>,
 {
     futures::pin_mut!(body);
     let mut out: Vec<u8> = Vec::new();
@@ -278,4 +313,11 @@ where
 {
     let buf = read_limited(body, max_bytes).await?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+pub(crate) async fn read_limited_text_result<S>(body: S, max_bytes: usize) -> Result<String>
+where
+    S: Stream<Item = Result<Bytes>>,
+{
+    Ok(String::from_utf8_lossy(&read_limited_result(body, max_bytes).await?).into_owned())
 }

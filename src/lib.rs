@@ -68,27 +68,30 @@ pub use crate::auth::{
     WebAuthorizationCallbackParams, WebAuthorizationPending, WebAuthorizationRequest,
 };
 pub use crate::core::{
-    ChatUsageEvent, Client, Config, FileTokenStore, FilterStatus, InMemoryTokenStore, TokenStore,
-    DEFAULT_GATEWAY_BASE_URL,
+    read_gateway_request_id, ChatOptions, ChatUsageEvent, Client, Config, FileTokenStore,
+    FilterStatus, GatewayRequestIDCallback, HttpBody, HttpClient, HttpContext, HttpPurpose,
+    HttpRequest, HttpResponse, HttpResponseMode, HttpTransport, InMemoryTokenStore, TokenStore,
+    TransportError, UpstreamActivityCallback, DEFAULT_GATEWAY_BASE_URL, GATEWAY_REQUEST_ID_HEADER,
 };
 // === models 域逐项 re-export（对齐 models/index.ts）===
 pub use crate::models::{
     anthropic_response_text_content, anthropic_response_thinking_content,
     anthropic_response_tool_use_blocks, bucket_info_is_commercial, bucket_row_is_commercial,
-    build_betas, extract_anthropic_block_meta, find_desktop_visual_understanding_model,
-    find_first_model_by_input_modality, get_adapter, get_adapter_for_model, is_sse_comment_line,
-    model_supports_image_input, model_supports_input_modality, new_openai_stream_converter,
-    new_thinking_config, new_web_search_tool, parse_settlement, parse_sources_event, unique_merge,
-    validate_end_user_id, zero_model_capabilities, Adapter, AnthropicContentBlock,
-    AnthropicResponse, AnthropicUsage, BlockMeta, BucketInfo, BucketRow, ChatContentBlock,
-    ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig, EmbeddingData, EmbeddingInput,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, GeoLoc, ImageGenerationRequest,
-    ImageGenerationResponse, InputModality, ManagedModel, ModelCapabilities, MultimodalContent,
-    OpenAIChatChoice, OpenAIChatMessage, OpenAIChatResponse, OpenAIFunctionCall,
-    OpenAIStreamChoice, OpenAIStreamChunk, OpenAIStreamConverter, OpenAIStreamDelta,
-    OpenAIStreamToolCall, OpenAIToolCall, OpenAIUsage, OutputConfig, ProviderFormat, QuotaSummary,
-    RerankDocument, RerankQuery, RerankRequest, RerankResponse, RerankResult, ServerTool,
-    SourcesEvent, StreamEvent, StreamSettlement, ThinkingConfig, VideoGenerationRequest,
+    build_betas, classify_sources_event, extract_anthropic_block_meta,
+    find_desktop_visual_understanding_model, find_first_model_by_input_modality, get_adapter,
+    get_adapter_for_model, is_sse_comment_line, model_supports_image_input,
+    model_supports_input_modality, new_openai_stream_converter, new_thinking_config,
+    new_web_search_tool, parse_settlement, parse_sources_event, unique_merge, validate_end_user_id,
+    zero_model_capabilities, Adapter, AnthropicContentBlock, AnthropicResponse, AnthropicUsage,
+    BlockMeta, BucketInfo, BucketRow, ChatContentBlock, ChatMessage, ChatRequest, ChatResponse,
+    ChatUsage, EffortConfig, EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, GeoLoc, ImageGenerationRequest, ImageGenerationResponse, InputModality,
+    ManagedModel, ModelCapabilities, MultimodalContent, OpenAIChatChoice, OpenAIChatMessage,
+    OpenAIChatResponse, OpenAIFunctionCall, OpenAIStreamChoice, OpenAIStreamChunk,
+    OpenAIStreamConverter, OpenAIStreamDelta, OpenAIStreamToolCall, OpenAIToolCall, OpenAIUsage,
+    OutputConfig, ProviderFormat, QuotaSummary, RerankDocument, RerankQuery, RerankRequest,
+    RerankResponse, RerankResult, ServerTool, SourcesEvent, SourcesEventIssueCode,
+    SourcesEventParseResult, StreamEvent, StreamSettlement, ThinkingConfig, VideoGenerationRequest,
     VideoTaskResponse, WebSearchConfig, WebSearchSource, MAX_END_USER_ID_LENGTH,
     SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
 };
@@ -186,12 +189,21 @@ pub use crate::chatbridge::{
 };
 pub use shared::{Error, Result};
 
+pub use crate::auth::auth::{
+    complete_web_authorization_request_with_transport, discover_web_oauth_metadata_with_transport,
+    discover_with_profile_with_transport, exchange_code_with_expiry_with_transport,
+    exchange_code_with_transport, refresh_token_with_transport,
+    register_web_oauth_client_with_transport, register_with_transport, revoke_token_with_transport,
+};
+
+pub use crate::auth::auth::discover_with_transport;
+
 #[cfg(test)]
 mod scaffold_tests {
     use super::*;
 
     #[test]
     fn version_is_wired() {
-        assert_eq!(VERSION, "2.17.0");
+        assert_eq!(VERSION, "3.0.0");
     }
 }

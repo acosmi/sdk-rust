@@ -74,3 +74,12 @@ pub use scopes::{
     SCOPE_REMOTE_CONTROL_AGENT_RUN, SCOPE_REMOTE_CONTROL_PERMISSION_RESPONSE,
     SCOPE_REMOTE_CONTROL_SESSION_CONTROL, SCOPE_SKILLS,
 };
+
+pub use crate::auth::auth::{
+    complete_web_authorization_request_with_transport, discover_web_oauth_metadata_with_transport,
+    discover_with_profile_with_transport, exchange_code_with_expiry_with_transport,
+    exchange_code_with_transport, refresh_token_with_transport,
+    register_web_oauth_client_with_transport, register_with_transport, revoke_token_with_transport,
+};
+
+pub use crate::auth::auth::discover_with_transport;

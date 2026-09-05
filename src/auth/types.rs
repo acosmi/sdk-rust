@@ -17,7 +17,7 @@ pub struct ServerMetadata {
 }
 
 /// OAuth token 响应。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
@@ -29,7 +29,7 @@ pub struct TokenResponse {
 }
 
 /// 持久化 token 对。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
@@ -41,7 +41,7 @@ pub struct TokenSet {
 }
 
 /// 动态注册响应。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClientRegistration {
     pub client_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +72,37 @@ pub fn token_set_is_expired(t: &TokenSet) -> bool {
 /// 缺字段 / 类型错 → `Err` → 视为无 token。
 pub fn is_valid_token_set(x: &serde_json::Value) -> bool {
     serde_json::from_value::<TokenSet>(x.clone()).is_ok()
+}
+
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ClientRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientRegistration").finish_non_exhaustive()
+    }
+}
+
+impl zeroize::Zeroize for TokenSet {
+    fn zeroize(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+impl zeroize::Zeroize for TokenResponse {
+    fn zeroize(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
 }
 
 #[cfg(test)]

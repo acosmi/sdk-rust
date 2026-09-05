@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [3.0.0] - 2026-09-05 — Custom HTTP transport and model gateway observers
+
+### Compatibility
+
+- Major version because adding public ManagedModel.thinking_levels requires existing exhaustive Rust struct literals to add thinking_levels: None or use ..Default::default(). JSON omission remains compatible. Existing Client, Config, TokenStore and OAuth method signatures remain available.
+- This release covers the audited model gateway contract of TypeScript 2.19.0; version numbers do not imply full SDK feature parity.
+- Strict SSE decoding now rejects invalid UTF-8 and every oversized line. Billing ID observers accept a single bounded ASCII identifier, more restrictive than the TypeScript callback's whitespace-only check.
+- OAuth error Display/Debug no longer prints server error descriptions. Transport failures expose stable, payload-free categories.
+
+### Added
+
+- Exclusive HttpTransport injection through Client::new_with_transport / create_with_transport. Owned request metadata identifies purpose, buffered/streaming response mode and the existing timeout budget. HTTP responses expose headers and a lazy byte stream.
+- OAuth *_with_transport free functions share the same transport through HttpClient. Custom mode explicitly rejects unsupported multipart and WebSocket operations; it never falls back to direct HTTP.
+- ChatOptions with upstream activity and billing request ID observers on both wire formats; old chat methods keep their signatures. Includes chat_stream_with_usage_with_options.
+- ManagedModel.thinking_levels retains missing, empty and unknown-level semantics. classify_sources_event distinguishes non-sources, empty, valid and malformed events while retaining the legacy parser.
+
+### Fixed and security
+
+- SSE line size checks occur before copying, including complete lines within one network chunk and CRLF split across chunks; UTF-8 decoding is strict.
+- Cancellation covers response headers/body and token refresh mutex/store waits. Dropping a response cancels its transport token and releases the underlying stream.
+- Token DTOs and registration secrets have redacted Debug output. Internal token caches and serialized file buffers are zeroized when released. Public token snapshots and third-party HTTP/header copies retain their existing ownership semantics.
+- Nonstream inference keeps its 11-minute budget; streaming bodies have no SDK global timeout. Non-idempotent streams do not retry; the existing single 401 refresh remains.
+- Linux and macOS CI, MSRV verification, tag/version/exact-commit CI release checks, and published crate byte verification with checksums and source provenance.
+
+See [transport and observer integration](./docs/transport-and-observers.md) for contracts and limitations.
+
 ## [2.17.0] - 2026-08-15 — 桌面 loopback OAuth：state 全形态闸 + 常驻多连接回调服务
 
 与 `@acosmi/sdk-ts` 2.17.0 的桌面 loopback state 语义同契约（跳号说明见文末）。本版是

@@ -14,6 +14,7 @@
 //! 所有 HTTP 经传入的 `reqwest::Client`（对应 TS `fetchImpl`），auth 专用 30s 超时。
 
 use crate::auth::types::{ClientRegistration, ServerMetadata, TokenResponse, TokenSet};
+use crate::core::transport::{HttpClient, HttpPurpose};
 use crate::shared::errors::{Error, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -28,7 +29,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// token 端点（exchange / refresh）的结构化错误。携带 OAuth `error` 码用于
 /// `is_invalid_grant_error` 判定（invalid_grant → 本地 token 失效，需重登）。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthTokenEndpointError {
     pub status: u16,
     pub oauth_error: String,
@@ -37,12 +38,7 @@ pub struct OAuthTokenEndpointError {
 
 impl std::fmt::Display for OAuthTokenEndpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let detail = if !self.error_description.is_empty() {
-            &self.error_description
-        } else {
-            &self.oauth_error
-        };
-        write!(f, "token: HTTP {}: {}", self.status, detail)
+        write!(f, "token: HTTP {}", self.status)
     }
 }
 
@@ -85,8 +81,8 @@ impl OAuthMetadataProfile {
 ///
 /// `server_url` 可能含路径（如 `https://acosmi.ai/api/v4`）；well-known 端点按 RFC 8414
 /// 必须在 origin 根路径：`https://acosmi.ai/.well-known/oauth-authorization-server/<profile>`。
-pub async fn discover_with_profile(
-    http: &reqwest::Client,
+pub async fn discover_with_profile_with_transport(
+    http: &HttpClient,
     server_url: &str,
     profile: OAuthMetadataProfile,
 ) -> Result<ServerMetadata> {
@@ -108,6 +104,7 @@ pub async fn discover_with_profile(
 
     let resp = http
         .get(&endpoint)
+        .purpose(HttpPurpose::OAuthDiscovery)
         .timeout(AUTH_TIMEOUT)
         .send()
         .await
@@ -120,32 +117,34 @@ pub async fn discover_with_profile(
     let meta: ServerMetadata = resp
         .json()
         .await
-        .map_err(|e| Error::other(format!("discover: decode: {e}")))?;
+        .map_err(|_| Error::other("discover: decode failed"))?;
 
     if meta.token_endpoint.is_empty() || meta.authorization_endpoint.is_empty() {
-        return Err(Error::other(format!(
-            "discover: metadata missing required endpoints (token={}, auth={})",
-            meta.token_endpoint, meta.authorization_endpoint
-        )));
+        return Err(Error::other(
+            "discover: metadata missing required endpoints",
+        ));
     }
 
     Ok(meta)
 }
 
 /// 从 well-known 端点获取 Desktop OAuth 服务元数据。对应 TS `discover`。
-pub async fn discover(http: &reqwest::Client, server_url: &str) -> Result<ServerMetadata> {
-    discover_with_profile(http, server_url, OAuthMetadataProfile::Desktop).await
+pub async fn discover_with_transport(
+    http: &HttpClient,
+    server_url: &str,
+) -> Result<ServerMetadata> {
+    discover_with_profile_with_transport(http, server_url, OAuthMetadataProfile::Desktop).await
 }
 
 /// 从 well-known 端点获取 Web OAuth 服务元数据。对应 TS `discoverWebOAuthMetadata`。
 ///
 /// 与 `discover` 行为一致，但请求 `web` profile（csign 等第一方 Web 应用必须用此 profile；
 /// `desktop` 返回的是桌面 loopback 端点，不可混用）。
-pub async fn discover_web_oauth_metadata(
-    http: &reqwest::Client,
+pub async fn discover_web_oauth_metadata_with_transport(
+    http: &HttpClient,
     server_url: &str,
 ) -> Result<ServerMetadata> {
-    discover_with_profile(http, server_url, OAuthMetadataProfile::Web).await
+    discover_with_profile_with_transport(http, server_url, OAuthMetadataProfile::Web).await
 }
 
 // =============================================================================
@@ -153,8 +152,8 @@ pub async fn discover_web_oauth_metadata(
 // =============================================================================
 
 /// 动态注册桌面客户端，获取 client_id。对应 TS `register`。
-pub async fn register(
-    http: &reqwest::Client,
+pub async fn register_with_transport(
+    http: &HttpClient,
     meta: &ServerMetadata,
     app_name: &str,
 ) -> Result<ClientRegistration> {
@@ -183,8 +182,8 @@ pub struct RegisterWebOAuthClientOptions {
 ///
 /// 与 `register`（桌面 loopback，硬编码 redirect_uri=127.0.0.1）的区别：本函数允许传入
 /// 任意 Web redirect_uri，供 csign 等第一方 Web 应用使用。auth method 仍为 `none`（PKCE public）。
-pub async fn register_web_oauth_client(
-    http: &reqwest::Client,
+pub async fn register_web_oauth_client_with_transport(
+    http: &HttpClient,
     meta: &ServerMetadata,
     opts: &RegisterWebOAuthClientOptions,
 ) -> Result<ClientRegistration> {
@@ -202,12 +201,13 @@ pub async fn register_web_oauth_client(
 }
 
 async fn post_register(
-    http: &reqwest::Client,
+    http: &HttpClient,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<ClientRegistration> {
     let resp = http
         .post(endpoint)
+        .purpose(HttpPurpose::OAuthRegistration)
         .timeout(AUTH_TIMEOUT)
         .json(&body)
         .send()
@@ -221,7 +221,7 @@ async fn post_register(
 
     resp.json()
         .await
-        .map_err(|e| Error::other(format!("register: decode: {e}")))
+        .map_err(|_| Error::other("register: decode failed"))
 }
 
 // =============================================================================
@@ -370,8 +370,8 @@ pub struct LoginOptions {
 // =============================================================================
 
 /// authorization_code 换 token。对应 TS `exchangeCode`。
-pub async fn exchange_code(
-    http: &reqwest::Client,
+pub async fn exchange_code_with_transport(
+    http: &HttpClient,
     meta: &ServerMetadata,
     client_id: &str,
     code: &str,
@@ -390,8 +390,8 @@ pub async fn exchange_code(
 
 /// 与 [`exchange_code`] 相同，但附带 `expires_in` 参数（setup-token 模式）。
 /// 对应 TS `exchangeCodeWithExpiry`（TS barrel 漏 re-export，此处补齐导出）。
-pub async fn exchange_code_with_expiry(
-    http: &reqwest::Client,
+pub async fn exchange_code_with_expiry_with_transport(
+    http: &HttpClient,
     meta: &ServerMetadata,
     client_id: &str,
     code: &str,
@@ -414,8 +414,8 @@ pub async fn exchange_code_with_expiry(
 /// 刷新 access_token。对应 TS `refreshToken`。
 ///
 /// 轮换语义（换新撤旧）由 Client 协调：网关签发新 refresh_token，旧 RT 服务端作废。
-pub async fn refresh_token(
-    http: &reqwest::Client,
+pub async fn refresh_token_with_transport(
+    http: &HttpClient,
     meta: &ServerMetadata,
     client_id: &str,
     refresh_token_value: &str,
@@ -429,8 +429,8 @@ pub async fn refresh_token(
 }
 
 /// 吊销 token。服务端不支持吊销（`revocation_endpoint` 为空）时静默跳过。对应 TS `revokeToken`。
-pub async fn revoke_token(
-    http: &reqwest::Client,
+pub async fn revoke_token_with_transport(
+    http: &HttpClient,
     meta: &ServerMetadata,
     token: &str,
 ) -> Result<()> {
@@ -439,6 +439,7 @@ pub async fn revoke_token(
     }
     let params = [("token", token)];
     http.post(&meta.revocation_endpoint)
+        .purpose(HttpPurpose::OAuthRevocation)
         .timeout(AUTH_TIMEOUT)
         .form(&params)
         .send()
@@ -448,12 +449,13 @@ pub async fn revoke_token(
 }
 
 async fn post_token(
-    http: &reqwest::Client,
+    http: &HttpClient,
     endpoint: &str,
     params: &[(&str, &str)],
 ) -> Result<TokenResponse> {
     let resp = http
         .post(endpoint)
+        .purpose(HttpPurpose::OAuthToken)
         .timeout(AUTH_TIMEOUT)
         .form(params)
         .send()
@@ -485,7 +487,7 @@ async fn post_token(
 
     resp.json()
         .await
-        .map_err(|e| Error::other(format!("token: decode: {e}")))
+        .map_err(|_| Error::other("token: decode failed"))
 }
 
 /// 从 `TokenResponse` 构造可持久化的 `TokenSet`。对应 TS `newTokenSet`。
@@ -620,9 +622,9 @@ pub struct WebAuthorizationCallbackParams {
 /// 对应 TS `completeWebAuthorizationRequest`。
 ///
 /// state 不匹配时返 `Err`（CSRF 防护）。内部依次：
-/// `discover_web_oauth_metadata(pending.server_url)` → `exchange_code(...)` → `new_token_set(...)`。
-pub async fn complete_web_authorization_request(
-    http: &reqwest::Client,
+/// `discover_web_oauth_metadata_with_transport(pending.server_url)` → `exchange_code_with_transport(...)` → `new_token_set(...)`。
+pub async fn complete_web_authorization_request_with_transport(
+    http: &HttpClient,
     pending: &WebAuthorizationPending,
     params: &WebAuthorizationCallbackParams,
 ) -> Result<TokenSet> {
@@ -637,8 +639,8 @@ pub async fn complete_web_authorization_request(
         )));
     }
 
-    let meta = discover_web_oauth_metadata(http, &pending.server_url).await?;
-    let resp = exchange_code(
+    let meta = discover_web_oauth_metadata_with_transport(http, &pending.server_url).await?;
+    let resp = exchange_code_with_transport(
         http,
         &meta,
         &pending.client_id,
@@ -1016,6 +1018,136 @@ mod loopback {
         // FIN：请求头已消费完毕，无 RST 截断响应之虞。
         let _ = stream.shutdown().await;
     }
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn discover_with_profile(
+    http: &reqwest::Client,
+    server_url: &str,
+    profile: OAuthMetadataProfile,
+) -> Result<ServerMetadata> {
+    discover_with_profile_with_transport(&HttpClient::legacy(http.clone()), server_url, profile)
+        .await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn discover_web_oauth_metadata(
+    http: &reqwest::Client,
+    server_url: &str,
+) -> Result<ServerMetadata> {
+    discover_web_oauth_metadata_with_transport(&HttpClient::legacy(http.clone()), server_url).await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn register(
+    http: &reqwest::Client,
+    meta: &ServerMetadata,
+    app_name: &str,
+) -> Result<ClientRegistration> {
+    register_with_transport(&HttpClient::legacy(http.clone()), meta, app_name).await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn register_web_oauth_client(
+    http: &reqwest::Client,
+    meta: &ServerMetadata,
+    opts: &RegisterWebOAuthClientOptions,
+) -> Result<ClientRegistration> {
+    register_web_oauth_client_with_transport(&HttpClient::legacy(http.clone()), meta, opts).await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn exchange_code(
+    http: &reqwest::Client,
+    meta: &ServerMetadata,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Result<TokenResponse> {
+    exchange_code_with_transport(
+        &HttpClient::legacy(http.clone()),
+        meta,
+        client_id,
+        code,
+        redirect_uri,
+        code_verifier,
+    )
+    .await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn exchange_code_with_expiry(
+    http: &reqwest::Client,
+    meta: &ServerMetadata,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    expires_in: i64,
+) -> Result<TokenResponse> {
+    exchange_code_with_expiry_with_transport(
+        &HttpClient::legacy(http.clone()),
+        meta,
+        client_id,
+        code,
+        redirect_uri,
+        code_verifier,
+        expires_in,
+    )
+    .await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn refresh_token(
+    http: &reqwest::Client,
+    meta: &ServerMetadata,
+    client_id: &str,
+    refresh_token_value: &str,
+) -> Result<TokenResponse> {
+    refresh_token_with_transport(
+        &HttpClient::legacy(http.clone()),
+        meta,
+        client_id,
+        refresh_token_value,
+    )
+    .await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn revoke_token(
+    http: &reqwest::Client,
+    meta: &ServerMetadata,
+    token: &str,
+) -> Result<()> {
+    revoke_token_with_transport(&HttpClient::legacy(http.clone()), meta, token).await
+}
+
+/// Compatibility entry point using the supplied reqwest client.
+pub async fn complete_web_authorization_request(
+    http: &reqwest::Client,
+    pending: &WebAuthorizationPending,
+    params: &WebAuthorizationCallbackParams,
+) -> Result<TokenSet> {
+    complete_web_authorization_request_with_transport(
+        &HttpClient::legacy(http.clone()),
+        pending,
+        params,
+    )
+    .await
+}
+
+impl std::fmt::Debug for OAuthTokenEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokenEndpointError")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Discover using the supplied reqwest client (legacy compatible entry point).
+pub async fn discover(http: &reqwest::Client, server_url: &str) -> Result<ServerMetadata> {
+    discover_with_transport(&HttpClient::legacy(http.clone()), server_url).await
 }
 
 #[cfg(test)]

@@ -382,6 +382,10 @@ pub fn bucket_info_is_commercial(b: Option<&BucketInfo>) -> bool {
 /// 托管模型。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManagedModel {
+    /// Gateway-declared thinking levels. Missing means unknown; an empty list means
+    /// no selectable levels. Unknown strings are retained for forward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
     pub id: String,
     pub name: String,
     pub provider: String,
@@ -800,6 +804,95 @@ pub struct SourcesEvent {
     pub sources: Vec<WebSearchSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+}
+
+/// Stable structural error codes for sources events (TypeScript parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcesEventIssueCode {
+    InvalidJson,
+    MissingSources,
+    SourcesNotArray,
+    SourceNotObject,
+    SourceTitleInvalid,
+    SourceUrlInvalid,
+    SourceSnippetInvalid,
+    SessionIdInvalid,
+}
+
+/// Distinguishes a legitimate empty result from a malformed sources event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourcesEventParseResult {
+    NotSources,
+    EmptySources {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    Sources {
+        value: SourcesEvent,
+    },
+    MalformedSources {
+        code: SourcesEventIssueCode,
+    },
+}
+
+/// Classify by SSE event name or JSON `type`, accepting unknown extra fields.
+/// Unlike the legacy [`parse_sources_event`], empty and malformed are distinct.
+pub fn classify_sources_event(ev: &StreamEvent) -> SourcesEventParseResult {
+    use SourcesEventIssueCode::*;
+    use SourcesEventParseResult::*;
+    let malformed = |code| MalformedSources { code };
+    let value: Value = match serde_json::from_str(&ev.data) {
+        Ok(value) => value,
+        Err(_) if ev.event == "sources" => return malformed(InvalidJson),
+        Err(_) => return NotSources,
+    };
+    if ev.event != "sources" && value.get("type").and_then(Value::as_str) != Some("sources") {
+        return NotSources;
+    }
+    let Some(raw_sources) = value.as_object().and_then(|v| v.get("sources")) else {
+        return malformed(MissingSources);
+    };
+    let session_id = match value.get("session_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return malformed(SessionIdInvalid),
+    };
+    let Some(raw_sources) = raw_sources.as_array() else {
+        return malformed(SourcesNotArray);
+    };
+    if raw_sources.is_empty() {
+        return EmptySources { session_id };
+    }
+    let mut sources = Vec::with_capacity(raw_sources.len());
+    for source in raw_sources {
+        if !source.is_object() {
+            return malformed(SourceNotObject);
+        }
+        let Some(title) = source.get("title").and_then(Value::as_str) else {
+            return malformed(SourceTitleInvalid);
+        };
+        let Some(url) = source.get("url").and_then(Value::as_str) else {
+            return malformed(SourceUrlInvalid);
+        };
+        let snippet = match source.get("snippet") {
+            None => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return malformed(SourceSnippetInvalid),
+        };
+        sources.push(WebSearchSource {
+            title: title.into(),
+            url: url.into(),
+            snippet,
+        });
+    }
+    Sources {
+        value: SourcesEvent {
+            sources,
+            session_id,
+        },
+    }
 }
 
 /// 从 [`StreamEvent`] 中解析搜索来源。返回 `None` 表示该事件不是 sources 类型。

@@ -16,7 +16,8 @@ use crate::agent_runs::types::{
 use crate::billing::entitlements::urlencoding;
 use crate::core::client::Client;
 use crate::core::http::{
-    iter_sse_lines, parse_http_error_with_retry_after, read_limited, read_limited_text,
+    iter_sse_lines_result as iter_sse_lines, parse_http_error_with_retry_after,
+    read_limited_result as read_limited, read_limited_text_result as read_limited_text,
     DEFAULT_JSON_TIMEOUT_MS, MAX_DOWNLOAD_SIZE, MAX_ERROR_BODY_SIZE,
 };
 use crate::shared::{ApiResponse, Error, Result};
@@ -650,7 +651,7 @@ impl Client {
         signal: Option<&'a CancellationToken>,
         retry_on_401: bool,
         accept: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<reqwest::Response>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::core::transport::Response>> + Send + 'a>> {
         Box::pin(self.agent_runs_request_raw_inner(
             method,
             path,
@@ -672,7 +673,7 @@ impl Client {
         retry_on_401: bool,
         accept: &str,
         retried: bool,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<crate::core::transport::Response> {
         let token = self.ensure_token(signal.cloned()).await?;
         let url = self.api_url(path);
         let m = reqwest::Method::from_bytes(method.as_bytes())
@@ -691,7 +692,21 @@ impl Client {
 
         // 🔴 流式安全：只走单次 do_request（绝不 do_request_with_retry）。
         let resp = self
-            .do_request(m.clone(), &url, &headers, body, signal)
+            .do_request(
+                m.clone(),
+                &url,
+                &headers,
+                body,
+                signal,
+                if accept == "text/event-stream" {
+                    crate::core::transport::HttpContext::streaming(
+                        crate::core::transport::HttpPurpose::Api,
+                        crate::core::http::DEFAULT_JSON_TIMEOUT_MS,
+                    )
+                } else {
+                    crate::core::transport::HttpContext::default()
+                },
+            )
             .await?;
 
         if resp.status().as_u16() == 401 && retry_on_401 && !retried {

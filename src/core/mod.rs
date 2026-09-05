@@ -29,3 +29,15 @@ pub use store::{
     new_file_token_store, FileLockDefaults, FileTokenStore, InMemoryTokenStore, TokenStore,
     FILE_LOCK_DEFAULTS,
 };
+
+pub mod observer;
+pub use observer::{
+    read_gateway_request_id, ChatOptions, GatewayRequestIDCallback, UpstreamActivityCallback,
+    GATEWAY_REQUEST_ID_HEADER,
+};
+
+pub mod transport;
+pub use transport::{
+    HttpBody, HttpClient, HttpContext, HttpPurpose, HttpRequest, HttpResponse, HttpResponseMode,
+    HttpTransport, TransportError,
+};

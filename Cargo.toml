@@ -1,6 +1,6 @@
 [package]
 name = "acosmi-sdk"
-version = "2.17.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Acosmi Rust SDK：模型网关、Agent Run Gateway 与 Compliance 统一客户端。双格式（Anthropic + OpenAI）。端口自 acosmi-sdk-ts。"
@@ -32,6 +32,8 @@ async-stream = "0.3"
 tokio-util = "0.7"
 url = "2"
 bytes = "1"
+http = "1"
+zeroize = "=1.8.2"
 # chrono：ISO 8601 / RFC3339 解析（token_set_is_expired 过期判断 + new_token_set 时间戳）。
 # 关 default（去掉 oldtime/wasmbind 等无关项），仅留 std + clock（Utc::now）。
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

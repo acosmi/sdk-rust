@@ -155,7 +155,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<()> {
         let (bytes, _) = self
-            .do_json_full_raw(method, path, body, signal, DEFAULT_JSON_TIMEOUT_MS)
+            .do_json_full_raw(method, path, body, signal, DEFAULT_JSON_TIMEOUT_MS, None)
             .await?;
         // 空体成功 → 跳业务码检查（方案 §4.4）。
         if bytes.is_empty() {

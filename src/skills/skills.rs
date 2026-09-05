@@ -9,8 +9,9 @@ use super::types::{
 use crate::billing::entitlements::urlencoding;
 use crate::core::client::Client;
 use crate::core::http::{
-    classify_transport, parse_http_error_with_retry_after, read_limited, read_limited_text,
-    CHAT_REQUEST_TIMEOUT_MS, MAX_DOWNLOAD_SIZE, MAX_ERROR_BODY_SIZE,
+    parse_http_error_with_retry_after, read_limited_result as read_limited,
+    read_limited_text_result as read_limited_text, CHAT_REQUEST_TIMEOUT_MS, MAX_DOWNLOAD_SIZE,
+    MAX_ERROR_BODY_SIZE,
 };
 use crate::shared::{ApiResponse, Error, Result};
 use tokio_util::sync::CancellationToken;
@@ -127,7 +128,7 @@ impl Client {
     /// 下载技能 ZIP 包（公共端点，双模式）。对应 TS `downloadSkill`。
     ///
     /// 有 token 时自动附带（享受无限流），无 token 时匿名（受限流）。
-    /// 50MB 上限走 [`MAX_DOWNLOAD_SIZE`] + [`read_limited`]；限流时抛 [`Error::RateLimit`]。
+    /// 50MB 上限走 [`MAX_DOWNLOAD_SIZE`] + [`crate::core::http::read_limited`]；限流时抛 [`Error::RateLimit`]。
     pub async fn download_skill(
         &self,
         skill_id: &str,
@@ -140,7 +141,12 @@ impl Client {
         let url = self.api_url(&path);
 
         // 公共端点允许无 token：拿不到 token 时匿名访问。
-        let mut rb = self.http().get(&url);
+        let mut rb = self.http().get(&url).cancel(ctl.clone()).context(
+            crate::core::transport::HttpContext::buffered(
+                crate::core::transport::HttpPurpose::Transfer,
+                SKILL_TRANSFER_TIMEOUT_MS,
+            ),
+        );
         if let Ok(token) = self.ensure_token(ctl.clone()).await {
             if !token.is_empty() {
                 rb = rb.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
@@ -154,8 +160,7 @@ impl Client {
                 _ = c.cancelled() => return Err(Error::other("download skill: aborted")),
             },
             None => send.await,
-        }
-        .map_err(|e| Error::Network(classify_transport(&format!("GET {path}"), &url, &e)))?;
+        }?;
 
         let status = resp.status();
         if status.as_u16() == 429 {
@@ -233,6 +238,11 @@ impl Client {
         let send = self
             .http()
             .post(&url)
+            .cancel(ctl.clone())
+            .context(crate::core::transport::HttpContext::buffered(
+                crate::core::transport::HttpPurpose::Transfer,
+                SKILL_TRANSFER_TIMEOUT_MS,
+            ))
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
             .multipart(form)
             .send();
@@ -242,8 +252,7 @@ impl Client {
                 _ = c.cancelled() => return Err(Error::other("upload: aborted".to_string())),
             },
             None => send.await,
-        }
-        .map_err(|e| Error::Network(classify_transport("POST /skill-store/upload", &url, &e)))?;
+        }?;
 
         // 401：单次 force_refresh 重试（防递归）。
         if resp.status().as_u16() == 401 && !retried {

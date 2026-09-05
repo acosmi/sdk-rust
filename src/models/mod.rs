@@ -14,17 +14,17 @@ pub mod wire_openai;
 
 // === 类型（对齐 export * from './types'）===
 pub use types::{
-    bucket_info_is_commercial, bucket_row_is_commercial, new_thinking_config, new_web_search_tool,
-    parse_settlement, parse_sources_event, zero_model_capabilities, BucketInfo, BucketRow,
-    ChatContentBlock, ChatMessage, ChatRequest, ChatResponse, ChatUsage, EffortConfig,
-    EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, GeoLoc,
-    ImageGenerationRequest, ImageGenerationResponse, InputModality, ManagedModel,
-    ModelCapabilities, MultimodalContent, OutputConfig, QuotaSummary, RerankDocument, RerankQuery,
-    RerankRequest, RerankResponse, RerankResult, ServerTool, SourcesEvent, StreamEvent,
-    StreamSettlement, ThinkingConfig, VideoGenerationRequest, VideoTaskResponse, WebSearchConfig,
-    WebSearchSource, BUCKET_CLASS_COMMERCIAL, BUCKET_CLASS_GENERIC, SERVER_TOOL_TYPE_WEB_SEARCH,
-    THINKING_HIGH, THINKING_HIGH_MIN_MAX_TOKENS, THINKING_MAX, THINKING_MAX_FALLBACK_MAX_TOKENS,
-    THINKING_OFF,
+    bucket_info_is_commercial, bucket_row_is_commercial, classify_sources_event,
+    new_thinking_config, new_web_search_tool, parse_settlement, parse_sources_event,
+    zero_model_capabilities, BucketInfo, BucketRow, ChatContentBlock, ChatMessage, ChatRequest,
+    ChatResponse, ChatUsage, EffortConfig, EmbeddingData, EmbeddingInput, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingUsage, GeoLoc, ImageGenerationRequest, ImageGenerationResponse,
+    InputModality, ManagedModel, ModelCapabilities, MultimodalContent, OutputConfig, QuotaSummary,
+    RerankDocument, RerankQuery, RerankRequest, RerankResponse, RerankResult, ServerTool,
+    SourcesEvent, SourcesEventIssueCode, SourcesEventParseResult, StreamEvent, StreamSettlement,
+    ThinkingConfig, VideoGenerationRequest, VideoTaskResponse, WebSearchConfig, WebSearchSource,
+    BUCKET_CLASS_COMMERCIAL, BUCKET_CLASS_GENERIC, SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH,
+    THINKING_HIGH_MIN_MAX_TOKENS, THINKING_MAX, THINKING_MAX_FALLBACK_MAX_TOKENS, THINKING_OFF,
 };
 
 // === Anthropic wire DTO（对齐 export * from './wire-anthropic'）===

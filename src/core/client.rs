@@ -12,12 +12,14 @@
 use crate::auth::auth as oauth;
 use crate::auth::types::{token_set_is_expired, ServerMetadata, TokenSet};
 use crate::core::http::{
-    classify_transport, iter_sse_lines, parse_http_error_with_retry_after, parse_stream_error,
-    read_limited_text, CHAT_REQUEST_TIMEOUT_MS, DEFAULT_JSON_TIMEOUT_MS, MAX_ERROR_BODY_SIZE,
-    MODEL_CACHE_TTL_MS,
+    iter_sse_lines_result as iter_sse_lines, parse_http_error_with_retry_after, parse_stream_error,
+    read_limited_text_result as read_limited_text, CHAT_REQUEST_TIMEOUT_MS,
+    DEFAULT_JSON_TIMEOUT_MS, MAX_ERROR_BODY_SIZE, MODEL_CACHE_TTL_MS,
 };
+use crate::core::observer::ChatOptions;
 use crate::core::retry::{effective_policy, EffectiveRetryPolicy, RetryPolicy, RetryRequestInfo};
 use crate::core::store::{FileTokenStore, InMemoryTokenStore, TokenStore};
+use crate::core::transport::{with_cancel, HttpClient, HttpContext, HttpPurpose, HttpTransport};
 use crate::macros::open_string_union;
 use crate::models::adapters::openai::parse_openai_response_to_anthropic;
 use crate::models::adapters::{get_adapter_for_model, Adapter, ProviderFormat};
@@ -127,13 +129,13 @@ pub(crate) struct ClientInner {
     browser_refresh_mode: BrowserRefreshMode,
     refresh_proxy_url: Option<String>,
     /// 共享 HTTP client。
-    http: reqwest::Client,
+    http: HttpClient,
     store: Arc<dyn TokenStore>,
     /// 生效重试策略。
     retry_policy: Option<EffectiveRetryPolicy>,
 
     // ── 可变状态 ──
-    tokens: RwLock<Option<TokenSet>>,
+    tokens: RwLock<Option<zeroize::Zeroizing<TokenSet>>>,
     /// 模型列表缓存（缺省模式 list_models 写入，全集模式不写）。对应 TS `modelCache`。
     model_cache: RwLock<Vec<crate::models::ManagedModel>>,
     /// 模型缓存写入时刻（TTL 判定基准）。对应 TS `modelCacheTimeMs`。
@@ -184,6 +186,26 @@ impl Client {
     /// assert_eq!(client.base_url(), "https://acosmi.com");
     /// ```
     pub fn new(cfg: Config) -> Result<Self> {
+        Self::new_inner(cfg, None)
+    }
+
+    /// Construct with an exclusive custom HTTP transport. `Config.http` is ignored.
+    /// Inject a TokenStore separately when caller-owned persistence is required.
+    pub fn new_with_transport(cfg: Config, transport: Arc<dyn HttpTransport>) -> Result<Self> {
+        Self::new_inner(cfg, Some(transport))
+    }
+
+    /// Construct with custom transport and load the configured token store.
+    pub async fn create_with_transport(
+        cfg: Config,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Result<Self> {
+        let client = Self::new_with_transport(cfg, transport)?;
+        client.sync_from_disk().await;
+        Ok(client)
+    }
+
+    fn new_inner(cfg: Config, transport: Option<Arc<dyn HttpTransport>>) -> Result<Self> {
         let server_url = match &cfg.server_url {
             Some(s) => normalize_gateway_base_url(s)?,
             None => DEFAULT_GATEWAY_BASE_URL.to_string(),
@@ -197,16 +219,20 @@ impl Client {
             None => None,
         };
 
-        let http = match cfg.http {
-            Some(c) => c,
-            None => reqwest::Client::builder()
-                // 🔴 绝不设 client 级 `.timeout(...)`：reqwest 的 timeout 覆盖整个响应体（含 SSE 流）
-                // 的总死线，会 abort >60s 的流式 SSE，也会抢先砍掉 11min 非流式 chat 的 per-request
-                // 死线（TS 用 fetch 无 client 级总超时）。死线一律靠 per-request `derive_timeout_token`
-                // （非流式）/ 调用方 signal（流式保长连接）派生。这里仅兜底连接握手。
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(Error::from)?,
+        let http = if let Some(transport) = transport {
+            HttpClient::new(transport)
+        } else {
+            HttpClient::legacy(match cfg.http {
+                Some(c) => c,
+                None => reqwest::Client::builder()
+                    // 🔴 绝不设 client 级 `.timeout(...)`：reqwest 的 timeout 覆盖整个响应体（含 SSE 流）
+                    // 的总死线，会 abort >60s 的流式 SSE，也会抢先砍掉 11min 非流式 chat 的 per-request
+                    // 死线（TS 用 fetch 无 client 级总超时）。死线一律靠 per-request `derive_timeout_token`
+                    // （非流式）/ 调用方 signal（流式保长连接）派生。这里仅兜底连接握手。
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .map_err(Error::from)?,
+            })
         };
 
         let store: Arc<dyn TokenStore> = match cfg.store {
@@ -254,7 +280,7 @@ impl Client {
     pub async fn create(cfg: Config) -> Result<Self> {
         let client = Client::new(cfg)?;
         if let Ok(Some(t)) = client.inner.store.load().await {
-            *client.inner.tokens.write().unwrap() = Some(t);
+            *client.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(t));
         }
         Ok(client)
     }
@@ -278,7 +304,12 @@ impl Client {
 
     /// 当前 token 快照（克隆）。
     pub fn token_set(&self) -> Option<TokenSet> {
-        self.inner.tokens.read().unwrap().clone()
+        self.inner
+            .tokens
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|t| (**t).clone())
     }
 
     /// compliance 端点 base override（`None` = 走默认 `{server_url}/admin-api`）。
@@ -307,7 +338,7 @@ impl Client {
     }
 
     /// 共享 HTTP client（内部 / 业务方法使用）。
-    pub(crate) fn http(&self) -> &reqwest::Client {
+    pub(crate) fn http(&self) -> &HttpClient {
         &self.inner.http
     }
 
@@ -377,9 +408,27 @@ impl Client {
 
         // 单航班门：标记 login 进行中，确保 finally 复位。
         self.inner.login_in_flight.store(true, Ordering::SeqCst);
-        let result = self
-            .login_steps(app_name, scopes, handler, opts, signal, &emit, &emit_error)
-            .await;
+        struct LoginReset<'a>(&'a AtomicBool, &'a tokio::sync::Notify);
+        impl Drop for LoginReset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+                self.1.notify_waiters();
+            }
+        }
+        let _reset = LoginReset(&self.inner.login_in_flight, &self.inner.token_ready);
+        let result = with_cancel(
+            signal.as_ref(),
+            self.login_steps(
+                app_name,
+                scopes,
+                handler,
+                opts,
+                signal.clone(),
+                &emit,
+                &emit_error,
+            ),
+        )
+        .await?;
         self.inner.login_in_flight.store(false, Ordering::SeqCst);
         result
     }
@@ -396,7 +445,12 @@ impl Client {
         emit_error: &dyn Fn(&str, &Error),
     ) -> Result<()> {
         // 1. 发现
-        let meta = match oauth::discover(self.http(), &self.inner.server_url).await {
+        let meta = match oauth::discover_with_transport(
+            &self.http().with_cancellation(signal.clone()),
+            &self.inner.server_url,
+        )
+        .await
+        {
             Ok(m) => m,
             Err(e) => {
                 emit_error(oauth::ERR_DISCOVERY, &e);
@@ -408,7 +462,13 @@ impl Client {
         // 2. 已有 client_id 则复用，无则注册
         let mut client_id = self.cached_client_id();
         if client_id.is_empty() {
-            match oauth::register(self.http(), &meta, app_name).await {
+            match oauth::register_with_transport(
+                &self.http().with_cancellation(signal.clone()),
+                &meta,
+                app_name,
+            )
+            .await
+            {
                 Ok(reg) => client_id = reg.client_id,
                 Err(e) => {
                     emit_error(oauth::ERR_REGISTRATION, &e);
@@ -424,7 +484,13 @@ impl Client {
         {
             Ok(r) => r,
             Err(first_err) => {
-                match oauth::register(self.http(), &meta, app_name).await {
+                match oauth::register_with_transport(
+                    &self.http().with_cancellation(signal.clone()),
+                    &meta,
+                    app_name,
+                )
+                .await
+                {
                     Ok(reg) => client_id = reg.client_id,
                     Err(reg_err) => {
                         emit_error(oauth::ERR_REGISTRATION, &reg_err);
@@ -446,8 +512,8 @@ impl Client {
         // 4. 换 token（支持自定义 expires_in）
         let token_resp = {
             let exchange = if let Some(exp) = opts.expires_in.filter(|&e| e > 0) {
-                oauth::exchange_code_with_expiry(
-                    self.http(),
+                oauth::exchange_code_with_expiry_with_transport(
+                    &self.http().with_cancellation(signal.clone()),
                     &meta,
                     &client_id,
                     &result.code,
@@ -457,8 +523,8 @@ impl Client {
                 )
                 .await
             } else {
-                oauth::exchange_code(
-                    self.http(),
+                oauth::exchange_code_with_transport(
+                    &self.http().with_cancellation(signal.clone()),
                     &meta,
                     &client_id,
                     &result.code,
@@ -482,11 +548,16 @@ impl Client {
         };
 
         // 5. 持久化 + 通知等待方
-        let tokens = oauth::new_token_set(&token_resp, &client_id, &self.inner.server_url);
-        *self.inner.tokens.write().unwrap() = Some(tokens.clone());
+        let token_resp = zeroize::Zeroizing::new(token_resp);
+        let tokens = zeroize::Zeroizing::new(oauth::new_token_set(
+            &token_resp,
+            &client_id,
+            &self.inner.server_url,
+        ));
+        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*tokens).clone()));
         self.inner.token_ready.notify_waiters();
-        if let Err(e) = self.inner.store.save(&tokens).await {
-            return Err(Error::other(format!("save tokens: {e}")));
+        if self.inner.store.save(&tokens).await.is_err() {
+            return Err(Error::other("save tokens failed"));
         }
 
         // 6. 完成
@@ -524,7 +595,6 @@ impl Client {
 
     /// 吊销 token 并清除本地存储。对应 TS `logout`。
     pub async fn logout(&self, signal: Option<CancellationToken>) -> Result<()> {
-        let _ = &signal; // revoke 经 auth helper（auth 专用超时）；取消信号当前未穿透到 revoke。
         let tokens = self.inner.tokens.write().unwrap().take();
         let mut meta = self.inner.meta.write().unwrap().take();
         // 重置等待信号：下次 login 重新触发等待→唤醒流程。
@@ -533,21 +603,33 @@ impl Client {
         if let Some(tokens) = tokens {
             if meta.is_none() {
                 // token-lifecycle discovery：revoke 必须打与签发 token 同 profile 的端点。
-                match self.discover_for_lifecycle().await {
+                match self.discover_for_lifecycle(signal.clone()).await {
                     Ok(m) => meta = Some(m),
-                    Err(e) => {
-                        eprintln!("[acosmi-sdk] warning: discover for revocation failed: {e}");
+                    Err(_) => {
+                        eprintln!("[acosmi-sdk] warning: discover for revocation failed");
                     }
                 }
             }
             if let Some(meta) = meta {
                 // 吊销失败静默忽略（best-effort）。
-                let _ = oauth::revoke_token(self.http(), &meta, &tokens.access_token).await;
-                let _ = oauth::revoke_token(self.http(), &meta, &tokens.refresh_token).await;
+                let _ = oauth::revoke_token_with_transport(
+                    &self.http().with_cancellation(signal.clone()),
+                    &meta,
+                    &tokens.access_token,
+                )
+                .await;
+                let _ = oauth::revoke_token_with_transport(
+                    &self.http().with_cancellation(signal.clone()),
+                    &meta,
+                    &tokens.refresh_token,
+                )
+                .await;
             }
         }
 
-        self.inner.store.clear().await
+        with_cancel(signal.as_ref(), self.inner.store.clear())
+            .await?
+            .map_err(|_| Error::other("token store clear failed"))
     }
 
     // ── Token 管理（对应 TS ensureToken / forceRefresh）──
@@ -560,6 +642,10 @@ impl Client {
     ///   - 过期 → 双层串行：`mu`（进程内单航班）+ `store.lock`（跨进程临界区）；进入临界区后
     ///     先 `store.load()` 重读磁盘（多进程 rotation 防 400），双检过期决定是否真刷新。
     pub async fn ensure_token(&self, signal: Option<CancellationToken>) -> Result<String> {
+        with_cancel(signal.as_ref(), self.ensure_token_internal(signal.clone())).await?
+    }
+
+    async fn ensure_token_internal(&self, signal: Option<CancellationToken>) -> Result<String> {
         let mut tokens = self.token_set();
 
         if tokens.is_none() {
@@ -603,7 +689,12 @@ impl Client {
 
         // 需刷新 — 双层串行：mu 进程内 + store.lock 跨进程。
         let _g = self.inner.mu.lock().await;
-        let _lock = self.inner.store.lock().await?;
+        let _lock = self
+            .inner
+            .store
+            .lock()
+            .await
+            .map_err(|_| Error::other("token store lock failed"))?;
 
         // 进入临界区后先同步磁盘（别的进程可能已 rotation）。
         self.sync_from_disk().await;
@@ -626,8 +717,17 @@ impl Client {
     /// 同 [`Self::ensure_token`] 的刷新路径：mu + store.lock + syncFromDisk。别的进程刚 rotation
     /// 过的话磁盘上是新 RT，本进程用磁盘新 RT 即可成功；否则用旧 RT 必撞 "refresh token not found" 400。
     pub async fn force_refresh(&self, signal: Option<CancellationToken>) -> Result<()> {
+        with_cancel(signal.as_ref(), self.force_refresh_internal(signal.clone())).await?
+    }
+
+    async fn force_refresh_internal(&self, signal: Option<CancellationToken>) -> Result<()> {
         let _g = self.inner.mu.lock().await;
-        let _lock = self.inner.store.lock().await?;
+        let _lock = self
+            .inner
+            .store
+            .lock()
+            .await
+            .map_err(|_| Error::other("token store lock failed"))?;
         self.sync_from_disk().await;
         if self.token_set().is_none() {
             return Err(Error::other("no tokens to refresh"));
@@ -648,12 +748,20 @@ impl Client {
     }
 
     /// token-lifecycle discovery：revoke / refresh 必须打与签发 token 同 profile 的端点。
-    async fn discover_for_lifecycle(&self) -> Result<ServerMetadata> {
+    async fn discover_for_lifecycle(
+        &self,
+        signal: Option<CancellationToken>,
+    ) -> Result<ServerMetadata> {
         let profile = match self.inner.oauth_metadata_profile {
             OAuthMetadataProfile::Desktop => oauth::OAuthMetadataProfile::Desktop,
             OAuthMetadataProfile::Web => oauth::OAuthMetadataProfile::Web,
         };
-        oauth::discover_with_profile(self.http(), &self.inner.server_url, profile).await
+        oauth::discover_with_profile_with_transport(
+            &self.http().with_cancellation(signal),
+            &self.inner.server_url,
+            profile,
+        )
+        .await
     }
 
     /// 刷新当前 token（轮换：换新撤旧）。`browser_refresh_mode` 决定 direct / server-proxy / none。
@@ -666,18 +774,19 @@ impl Client {
                 "{ERR_TOKEN_EXPIRED}: token refresh disabled"
             ))),
             BrowserRefreshMode::ServerProxy => self.refresh_via_proxy(signal).await,
-            BrowserRefreshMode::Direct => self.refresh_direct().await,
+            BrowserRefreshMode::Direct => self.refresh_direct(signal).await,
         }
     }
 
-    async fn refresh_direct(&self) -> Result<()> {
-        let cur = self
-            .token_set()
-            .ok_or_else(|| Error::other("no tokens to refresh"))?;
+    async fn refresh_direct(&self, signal: Option<CancellationToken>) -> Result<()> {
+        let cur = zeroize::Zeroizing::new(
+            self.token_set()
+                .ok_or_else(|| Error::other("no tokens to refresh"))?,
+        );
 
         // 确保 meta（与签发同 profile）。
         if self.inner.meta.read().unwrap().is_none() {
-            match self.discover_for_lifecycle().await {
+            match self.discover_for_lifecycle(signal.clone()).await {
                 Ok(m) => *self.inner.meta.write().unwrap() = Some(m),
                 Err(e) => return Err(Error::other(format!("discover for refresh: {e}"))),
             }
@@ -690,8 +799,8 @@ impl Client {
             .clone()
             .ok_or_else(|| Error::other("discover for refresh: no metadata"))?;
 
-        let token_resp = match oauth::refresh_token(
-            self.http(),
+        let token_resp = match oauth::refresh_token_with_transport(
+            &self.http().with_cancellation(signal),
             &meta,
             &cur.client_id,
             &cur.refresh_token,
@@ -716,16 +825,22 @@ impl Client {
             }
         };
 
-        let new_set = oauth::new_token_set(&token_resp, &cur.client_id, &self.inner.server_url);
-        *self.inner.tokens.write().unwrap() = Some(new_set.clone());
+        let token_resp = zeroize::Zeroizing::new(token_resp);
+        let new_set = zeroize::Zeroizing::new(oauth::new_token_set(
+            &token_resp,
+            &cur.client_id,
+            &self.inner.server_url,
+        ));
+        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*new_set).clone()));
         self.save_refreshed_token(&new_set).await;
         Ok(())
     }
 
     async fn refresh_via_proxy(&self, signal: Option<CancellationToken>) -> Result<()> {
-        let cur = self
-            .token_set()
-            .ok_or_else(|| Error::other("no tokens to refresh"))?;
+        let cur = zeroize::Zeroizing::new(
+            self.token_set()
+                .ok_or_else(|| Error::other("no tokens to refresh"))?,
+        );
         let proxy_url = self.inner.refresh_proxy_url.as_deref().ok_or_else(|| {
             Error::other(format!(
                 "{ERR_REFRESH_PROXY_FAILED}: refreshProxyURL is required"
@@ -743,7 +858,12 @@ impl Client {
             "server_url": server_url,
         });
 
-        let req = self.http().post(proxy_url).json(&body);
+        let req = self
+            .http()
+            .post(proxy_url)
+            .purpose(HttpPurpose::OAuthToken)
+            .cancel(signal.clone())
+            .json(&body);
         let send = req.send();
         let resp = match signal {
             Some(cancel) => tokio::select! {
@@ -758,33 +878,23 @@ impl Client {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let (mut message, oauth_error) = match resp.json::<serde_json::Value>().await {
-                Ok(b) => {
-                    let err = b
-                        .get("error")
+            let oauth_error = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| {
+                    body.get("error")
                         .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let desc = b
-                        .get("error_description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    (if desc.is_empty() { err.clone() } else { desc }, err)
-                }
-                Err(_) => (String::new(), String::new()),
-            };
-            if oauth_error == "invalid_grant" {
+                        .map(str::to_owned)
+                });
+            if oauth_error.as_deref() == Some("invalid_grant") {
                 self.clear_invalid_refresh_token().await;
                 return Err(Error::other(format!(
                     "{ERR_REFRESH_PROXY_FAILED}: refresh token invalid; local tokens cleared"
                 )));
             }
-            if message.is_empty() {
-                message = format!("HTTP {status}");
-            }
             return Err(Error::other(format!(
-                "{ERR_REFRESH_PROXY_FAILED}: HTTP {status}: {message}"
+                "{ERR_REFRESH_PROXY_FAILED}: HTTP {status}"
             )));
         }
 
@@ -797,21 +907,21 @@ impl Client {
         let parsed: ProxyResp = resp
             .json()
             .await
-            .map_err(|e| Error::other(format!("{ERR_REFRESH_PROXY_FAILED}: decode: {e}")))?;
+            .map_err(|_| Error::other(format!("{ERR_REFRESH_PROXY_FAILED}: decode failed")))?;
         let new_set = parsed.token_set.ok_or_else(|| {
             Error::other(format!(
                 "{ERR_REFRESH_PROXY_FAILED}: response missing tokenSet"
             ))
         })?;
 
-        *self.inner.tokens.write().unwrap() = Some(new_set.clone());
+        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(new_set.clone()));
         self.save_refreshed_token(&new_set).await;
         Ok(())
     }
 
     async fn save_refreshed_token(&self, tokens: &TokenSet) {
-        if let Err(e) = self.inner.store.save(tokens).await {
-            eprintln!("[acosmi-sdk] warning: save refreshed token failed: {e}");
+        if self.inner.store.save(tokens).await.is_err() {
+            eprintln!("[acosmi-sdk] warning: save refreshed token failed");
         }
     }
 
@@ -819,8 +929,8 @@ impl Client {
         *self.inner.tokens.write().unwrap() = None;
         *self.inner.meta.write().unwrap() = None;
         self.inner.login_in_flight.store(false, Ordering::SeqCst);
-        if let Err(e) = self.inner.store.clear().await {
-            eprintln!("[acosmi-sdk] warning: clear invalid token failed: {e}");
+        if self.inner.store.clear().await.is_err() {
+            eprintln!("[acosmi-sdk] warning: clear invalid token failed");
         }
     }
 
@@ -843,7 +953,7 @@ impl Client {
             }
         };
         if adopt {
-            *self.inner.tokens.write().unwrap() = Some(on_disk);
+            *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(on_disk));
         }
     }
 
@@ -896,7 +1006,7 @@ impl Client {
         // per-request 死线（对齐 TS doPublicJSON 30s）：去掉 client 级总超时后，公共 GET 必须
         // 自派生 30s 子 token，否则变无超时。超时或 parent signal 取消任一触发即 abort。
         let signal = self.derive_timeout_token(DEFAULT_JSON_TIMEOUT_MS, signal);
-        let send = self.http().get(&url).send();
+        let send = self.http().get(&url).cancel(signal.clone()).send();
         let resp = match &signal {
             Some(cancel) => tokio::select! {
                 r = send => r,
@@ -905,14 +1015,7 @@ impl Client {
                 }
             },
             None => send.await,
-        }
-        .map_err(|e| {
-            Error::Network(crate::core::http::classify_transport(
-                &format!("GET {path}"),
-                &url,
-                &e,
-            ))
-        })?;
+        }?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -944,13 +1047,17 @@ impl Client {
         // per-request 死线（对齐 TS doJSONGet 30s）：去掉 client 级总超时后，GET 必须自派生 30s
         // 子 token，否则变无超时。401 重试沿用原 `signal` 各自重新派生（见下方递归调用）。
         let req_signal = self.derive_timeout_token(DEFAULT_JSON_TIMEOUT_MS, signal.clone());
-        let token = self.ensure_token(req_signal.clone()).await?;
+        let token = zeroize::Zeroizing::new(self.ensure_token(req_signal.clone()).await?);
         let url = self.api_url(path);
 
         let send = self
             .http()
             .get(&url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .cancel(req_signal.clone())
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", token.as_str()),
+            )
             .send();
         let resp = match &req_signal {
             Some(cancel) => tokio::select! {
@@ -960,14 +1067,7 @@ impl Client {
                 }
             },
             None => send.await,
-        }
-        .map_err(|e| {
-            Error::Network(crate::core::http::classify_transport(
-                &format!("GET {path}"),
-                &url,
-                &e,
-            ))
-        })?;
+        }?;
 
         let status = resp.status();
 
@@ -1162,7 +1262,7 @@ impl Client {
 
     /// 单次 HTTP 请求（**无重试**）。对应 TS `doRequest`。
     ///
-    /// 传输层错误经 [`classify_transport`] 转 [`Error::Network`]（便于 retry policy 判定）。
+    /// 传输层错误经 [`crate::core::http::classify_transport`] 转 [`Error::Network`]（便于 retry policy 判定）。
     /// 取消信号经 `select!` 接入。**流式路径必须直接走此函数**，绝不经 [`Self::do_request_with_retry`]。
     pub(crate) async fn do_request(
         &self,
@@ -1171,34 +1271,20 @@ impl Client {
         headers: &[(reqwest::header::HeaderName, String)],
         body: Option<&str>,
         signal: Option<&CancellationToken>,
-    ) -> Result<reqwest::Response> {
-        let mut rb = self.http().request(method.clone(), url);
+        context: HttpContext,
+    ) -> Result<crate::core::transport::Response> {
+        let mut rb = self
+            .http()
+            .request(method.clone(), url)
+            .context(context)
+            .cancel(signal.cloned());
         for (k, v) in headers {
             rb = rb.header(k.clone(), v.clone());
         }
         if let Some(b) = body {
             rb = rb.body(b.to_string());
         }
-        let send = rb.send();
-        let resp = match signal {
-            Some(cancel) => tokio::select! {
-                r = send => r,
-                _ = cancel.cancelled() => {
-                    return Err(Error::Network(crate::shared::errors::NetworkError::new(
-                        format!("{method} {url}"),
-                        url,
-                        "request aborted",
-                    )));
-                }
-            },
-            None => send.await,
-        };
-        resp.map_err(|e| {
-            let path = Url::parse(url)
-                .map(|u| u.path().to_string())
-                .unwrap_or_else(|_| url.to_string());
-            Error::Network(classify_transport(&format!("{method} {path}"), url, &e))
-        })
+        rb.send().await
     }
 
     /// 带 RetryPolicy 的 [`Self::do_request`] 包装 —— **仅用于非流式路径**。对应 TS `doRequestWithRetry`。
@@ -1216,24 +1302,31 @@ impl Client {
         headers: &[(reqwest::header::HeaderName, String)],
         body: Option<&str>,
         signal: Option<&CancellationToken>,
-    ) -> Result<reqwest::Response> {
+        context: HttpContext,
+    ) -> Result<crate::core::transport::Response> {
         let policy = match self.retry_policy() {
             Some(p) => p.clone(),
-            None => return self.do_request(method, url, headers, body, signal).await,
+            None => {
+                return self
+                    .do_request(method, url, headers, body, signal, context)
+                    .await
+            }
         };
         let info = RetryRequestInfo {
             method: method.as_str().to_string(),
             url: url.to_string(),
         };
         if !(policy.safe_to_retry)(&info) {
-            return self.do_request(method, url, headers, body, signal).await;
+            return self
+                .do_request(method, url, headers, body, signal, context)
+                .await;
         }
 
         let mut last_err: Option<Error> = None;
         let mut attempt: u32 = 0;
         while attempt < policy.max_attempts {
             match self
-                .do_request(method.clone(), url, headers, body, signal)
+                .do_request(method.clone(), url, headers, body, signal, context)
                 .await
             {
                 Ok(resp) => {
@@ -1280,11 +1373,19 @@ impl Client {
         body: Option<&str>,
         signal: Option<CancellationToken>,
         timeout_ms: u64,
+        options: Option<ChatOptions>,
     ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
         // per-request 超时（对应 TS withRequestTimeout）：派生子 token，超时或 parent 取消任一触发即 abort。
         let ctl = self.derive_timeout_token(timeout_ms, signal);
-        self.do_json_full_raw_internal(method, path, body, ctl.as_ref(), false)
-            .await
+        self.do_json_full_raw_internal(
+            method,
+            path,
+            body,
+            ctl.as_ref(),
+            timeout_ms,
+            options.unwrap_or_default(),
+        )
+        .await
     }
 
     async fn do_json_full_raw_internal(
@@ -1293,51 +1394,72 @@ impl Client {
         path: &str,
         body: Option<&str>,
         signal: Option<&CancellationToken>,
-        retried: bool,
+        timeout_ms: u64,
+        mut options: ChatOptions,
     ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
-        let token = self.ensure_token(signal.cloned()).await?;
-        let url = self.api_url(path);
+        let mut retried = false;
+        loop {
+            let token = zeroize::Zeroizing::new(self.ensure_token(signal.cloned()).await?);
+            let url = self.api_url(path);
 
-        let mut headers: Vec<(reqwest::header::HeaderName, String)> =
-            vec![(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))];
-        if body.is_some() {
-            headers.push((
-                reqwest::header::CONTENT_TYPE,
-                "application/json".to_string(),
-            ));
-        }
+            let mut headers: Vec<(reqwest::header::HeaderName, String)> = vec![(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", token.as_str()),
+            )];
+            if body.is_some() {
+                headers.push((
+                    reqwest::header::CONTENT_TYPE,
+                    "application/json".to_string(),
+                ));
+            }
 
-        let resp = self
-            .do_request_with_retry(method.clone(), &url, &headers, body, signal)
-            .await?;
+            let resp = self
+                .do_request_with_retry(
+                    method.clone(),
+                    &url,
+                    &headers,
+                    body,
+                    signal,
+                    HttpContext::buffered(
+                        if timeout_ms == CHAT_REQUEST_TIMEOUT_MS {
+                            HttpPurpose::Model
+                        } else {
+                            HttpPurpose::Api
+                        },
+                        timeout_ms,
+                    ),
+                )
+                .await?;
 
-        // 401：单次 force_refresh 重试（防递归）。
-        if resp.status().as_u16() == 401 && !retried {
-            drop(resp); // 释放连接（对应 TS resp.body?.cancel()）。
-            self.force_refresh(signal.cloned())
+            // 401：单次 force_refresh 重试（防递归）。
+            if resp.status().as_u16() == 401 && !retried {
+                drop(resp); // 释放连接（对应 TS resp.body?.cancel()）。
+                self.force_refresh(signal.cloned())
+                    .await
+                    .map_err(|e| Error::other(format!("unauthorized and refresh failed: {e}")))?;
+                retried = true;
+                continue;
+            }
+
+            options.response(resp.headers());
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let retry_after = parse_retry_after_secs(resp.headers());
+                let text = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
+                return Err(Error::Http(parse_http_error_with_retry_after(
+                    status,
+                    &text,
+                    retry_after,
+                )));
+            }
+
+            let headers = resp.headers().clone();
+            let bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| Error::other(format!("unauthorized and refresh failed: {e}")))?;
-            return Box::pin(self.do_json_full_raw_internal(method, path, body, signal, true))
-                .await;
+                .map_err(|e| Error::other(format!("{method} {path}: read body: {e}")))?;
+            return Ok((bytes.to_vec(), headers));
         }
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let retry_after = parse_retry_after_secs(resp.headers());
-            let text = read_limited_text(resp.bytes_stream(), MAX_ERROR_BODY_SIZE).await?;
-            return Err(Error::Http(parse_http_error_with_retry_after(
-                status,
-                &text,
-                retry_after,
-            )));
-        }
-
-        let headers = resp.headers().clone();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::other(format!("{method} {path}: read body: {e}")))?;
-        Ok((bytes.to_vec(), headers))
     }
 
     /// POST/GET JSON + ApiResponse 解包（业务码检查）+ **空体契约**（方案 §4.4）。对应 TS `doJSONFull<T>`。
@@ -1353,7 +1475,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<(Option<T>, reqwest::header::HeaderMap)> {
         let (bytes, headers) = self
-            .do_json_full_raw(method, path, body, signal, DEFAULT_JSON_TIMEOUT_MS)
+            .do_json_full_raw(method, path, body, signal, DEFAULT_JSON_TIMEOUT_MS, None)
             .await?;
         if bytes.is_empty() {
             // 空 body 成功响应：跳业务码检查，返回 None（对应 TS `undefined as T`）。
@@ -1428,6 +1550,18 @@ impl Client {
         req: &ChatRequest,
         signal: Option<CancellationToken>,
     ) -> Result<ChatResponse> {
+        self.chat_with_options(model_id, req, signal, ChatOptions::default())
+            .await
+    }
+
+    /// Chat with optional billing response observation.
+    pub async fn chat_with_options(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
         // 浅拷贝 + 强制 stream=false（避免原地 mutate 调用方 req）。
         let mut r = req.clone();
         r.stream = Some(false);
@@ -1447,6 +1581,7 @@ impl Client {
                 Some(&body),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                Some(options),
             )
             .await?;
 
@@ -1492,6 +1627,7 @@ impl Client {
                 Some(&body),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                None,
             )
             .await?;
         serde_json::from_slice(&bytes).map_err(|e| Error::other(format!("{endpoint}: decode: {e}")))
@@ -1518,6 +1654,7 @@ impl Client {
                 Some(&body),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                None,
             )
             .await?;
         serde_json::from_slice(&bytes).map_err(|e| Error::other(format!("{endpoint}: decode: {e}")))
@@ -1558,6 +1695,7 @@ impl Client {
                 Some(&body),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                None,
             )
             .await?;
         Self::unwrap_api_response(&endpoint, &bytes)
@@ -1589,6 +1727,7 @@ impl Client {
                 Some(&body),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                None,
             )
             .await?;
         Self::unwrap_api_response(&endpoint, &bytes)
@@ -1619,6 +1758,7 @@ impl Client {
                 None,
                 signal,
                 DEFAULT_JSON_TIMEOUT_MS,
+                None,
             )
             .await?;
         Self::unwrap_api_response(&endpoint, &bytes)
@@ -1638,13 +1778,25 @@ impl Client {
         req: &ChatRequest,
         signal: Option<CancellationToken>,
     ) -> Result<AnthropicResponse> {
+        self.chat_messages_with_options(model_id, req, signal, ChatOptions::default())
+            .await
+    }
+
+    /// Chat with optional billing response observation.
+    pub async fn chat_messages_with_options(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+        options: ChatOptions,
+    ) -> Result<AnthropicResponse> {
         let m = self.ensure_model_cached(model_id, signal.clone()).await?;
         let adapter = get_adapter_for_model(&m);
         if adapter.format() == ProviderFormat::Anthropic {
-            self.chat_messages_anthropic(model_id, req, adapter, signal)
+            self.chat_messages_anthropic(model_id, req, adapter, signal, options)
                 .await
         } else {
-            self.chat_messages_openai(model_id, req, adapter, signal)
+            self.chat_messages_openai(model_id, req, adapter, signal, options)
                 .await
         }
     }
@@ -1655,6 +1807,7 @@ impl Client {
         req: &ChatRequest,
         adapter: Adapter,
         signal: Option<CancellationToken>,
+        options: ChatOptions,
     ) -> Result<AnthropicResponse> {
         let mut r = req.clone();
         r.stream = Some(false);
@@ -1673,6 +1826,7 @@ impl Client {
                 Some(&data),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                Some(options),
             )
             .await?;
 
@@ -1703,6 +1857,7 @@ impl Client {
         req: &ChatRequest,
         adapter: Adapter,
         signal: Option<CancellationToken>,
+        options: ChatOptions,
     ) -> Result<AnthropicResponse> {
         let mut r = req.clone();
         r.stream = Some(false);
@@ -1725,6 +1880,7 @@ impl Client {
                 Some(&data),
                 signal,
                 CHAT_REQUEST_TIMEOUT_MS,
+                Some(options),
             )
             .await?;
         // OpenAI 格式响应 → AnthropicResponse 转换（对齐 TS）。
@@ -1746,11 +1902,22 @@ impl Client {
         req: &ChatRequest,
         signal: Option<CancellationToken>,
     ) -> impl Stream<Item = Result<StreamEvent>> {
+        self.chat_stream_with_options(model_id, req, signal, ChatOptions::default())
+    }
+
+    /// The corresponding stream with optional activity and billing ID observers.
+    pub fn chat_stream_with_options(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+        options: ChatOptions,
+    ) -> impl Stream<Item = Result<StreamEvent>> {
         let this = self.clone();
         let model_id = model_id.to_string();
         let req = req.clone();
         async_stream::try_stream! {
-            let inner = this.chat_stream_gen(&model_id, &req, signal, false);
+            let inner = this.chat_stream_gen(&model_id, &req, signal, false, options);
             futures::pin_mut!(inner);
             while let Some(ev) = inner.next().await {
                 yield ev?;
@@ -1768,11 +1935,22 @@ impl Client {
         req: &ChatRequest,
         signal: Option<CancellationToken>,
     ) -> impl Stream<Item = Result<ChatUsageEvent>> {
+        self.chat_stream_with_usage_with_options(model_id, req, signal, ChatOptions::default())
+    }
+
+    /// The corresponding stream with optional activity and billing ID observers.
+    pub fn chat_stream_with_usage_with_options(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+        options: ChatOptions,
+    ) -> impl Stream<Item = Result<ChatUsageEvent>> {
         let this = self.clone();
         let model_id = model_id.to_string();
         let req = req.clone();
         async_stream::try_stream! {
-            let inner = this.chat_stream(&model_id, &req, signal);
+            let inner = this.chat_stream_with_options(&model_id, &req, signal, options);
             futures::pin_mut!(inner);
             while let Some(ev) = inner.next().await {
                 let ev = ev?;
@@ -1809,11 +1987,22 @@ impl Client {
         req: &ChatRequest,
         signal: Option<CancellationToken>,
     ) -> impl Stream<Item = Result<StreamEvent>> {
+        self.chat_messages_stream_with_options(model_id, req, signal, ChatOptions::default())
+    }
+
+    /// The corresponding stream with optional activity and billing ID observers.
+    pub fn chat_messages_stream_with_options(
+        &self,
+        model_id: &str,
+        req: &ChatRequest,
+        signal: Option<CancellationToken>,
+        options: ChatOptions,
+    ) -> impl Stream<Item = Result<StreamEvent>> {
         let this = self.clone();
         let model_id = model_id.to_string();
         let req = req.clone();
         async_stream::try_stream! {
-            let inner = this.chat_messages_stream_gen(&model_id, &req, signal, false);
+            let inner = this.chat_messages_stream_gen(&model_id, &req, signal, false, options);
             futures::pin_mut!(inner);
             while let Some(ev) = inner.next().await {
                 yield ev?;
@@ -1831,12 +2020,13 @@ impl Client {
         req: &'a ChatRequest,
         signal: Option<CancellationToken>,
         retried: bool,
+        mut options: ChatOptions,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'a>> {
         Box::pin(async_stream::try_stream! {
             let mut r = req.clone();
             r.stream = Some(true);
             let (body, adapter) = self.build_chat_request(model_id, &r, signal.clone()).await?;
-            let token = self.ensure_token(signal.clone()).await?;
+            let token = zeroize::Zeroizing::new(self.ensure_token(signal.clone()).await?);
 
             let endpoint = format!(
                 "/managed-models/{}{}",
@@ -1848,7 +2038,7 @@ impl Client {
 
             // 🔴 红线：流式只走 do_request（单次），绝不 do_request_with_retry。
             let resp = self
-                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref())
+                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref(), HttpContext::streaming(HttpPurpose::Model, CHAT_REQUEST_TIMEOUT_MS))
                 .await?;
 
             // 401 单次重试：force_refresh 后递归一次（retried guard 防递归）。
@@ -1857,13 +2047,15 @@ impl Client {
                 self.force_refresh(signal.clone()).await.map_err(|e| {
                     Error::other(format!("stream: unauthorized and refresh failed: {e}"))
                 })?;
-                let inner = self.chat_stream_gen(model_id, req, signal, true);
+                let inner = self.chat_stream_gen(model_id, req, signal, true, options);
                 futures::pin_mut!(inner);
                 while let Some(ev) = inner.next().await {
                     yield ev?;
                 }
                 return;
             }
+
+            options.response(resp.headers());
 
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
@@ -1888,8 +2080,9 @@ impl Client {
                 // 取消信号接入 SSE 读循环。cancel 触发 → 注入 abort 错误项。
                 let next: Option<Result<String>> = match &signal {
                     Some(cancel) => tokio::select! {
-                        l = lines.next() => l,
+                        biased;
                         _ = cancel.cancelled() => Some(Err(Error::other("stream: aborted"))),
+                        l = lines.next() => l,
                     },
                     None => lines.next().await,
                 };
@@ -1898,6 +2091,7 @@ impl Client {
                     None => break,
                 };
                 // 跳过 SSE 注释行（": keep-alive"）与空行。
+                options.activity();
                 if is_sse_comment_line(&line) || line.is_empty() {
                     continue;
                 }
@@ -1934,12 +2128,13 @@ impl Client {
         req: &'a ChatRequest,
         signal: Option<CancellationToken>,
         retried: bool,
+        mut options: ChatOptions,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'a>> {
         Box::pin(async_stream::try_stream! {
             let mut r = req.clone();
             r.stream = Some(true);
             let (body, adapter) = self.build_chat_request(model_id, &r, signal.clone()).await?;
-            let token = self.ensure_token(signal.clone()).await?;
+            let token = zeroize::Zeroizing::new(self.ensure_token(signal.clone()).await?);
 
             let endpoint = format!(
                 "/managed-models/{}{}",
@@ -1951,7 +2146,7 @@ impl Client {
 
             // 🔴 红线：流式只走 do_request（单次），绝不重试。
             let resp = self
-                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref())
+                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref(), HttpContext::streaming(HttpPurpose::Model, CHAT_REQUEST_TIMEOUT_MS))
                 .await?;
 
             if resp.status().as_u16() == 401 && !retried {
@@ -1959,13 +2154,15 @@ impl Client {
                 self.force_refresh(signal.clone()).await.map_err(|e| {
                     Error::other(format!("messages stream: unauthorized and refresh failed: {e}"))
                 })?;
-                let inner = self.chat_messages_stream_gen(model_id, req, signal, true);
+                let inner = self.chat_messages_stream_gen(model_id, req, signal, true, options);
                 futures::pin_mut!(inner);
                 while let Some(ev) = inner.next().await {
                     yield ev?;
                 }
                 return;
             }
+
+            options.response(resp.headers());
 
             if !resp.status().is_success() {
                 let status = resp.status().as_u16();
@@ -1989,8 +2186,9 @@ impl Client {
             loop {
                 let next: Option<Result<String>> = match &signal {
                     Some(cancel) => tokio::select! {
-                        l = lines.next() => l,
+                        biased;
                         _ = cancel.cancelled() => Some(Err(Error::other("messages stream: aborted"))),
+                        l = lines.next() => l,
                     },
                     None => lines.next().await,
                 };
@@ -1998,6 +2196,7 @@ impl Client {
                     Some(l) => l?,
                     None => break,
                 };
+                options.activity();
                 if is_sse_comment_line(&line) || line.is_empty() {
                     continue;
                 }
@@ -2071,7 +2270,7 @@ impl Client {
     /// 直接注入未过期 token（测试用，绕过 OAuth 登录流）。对应 TS `primeTokensForTest`。
     #[cfg(test)]
     fn prime_tokens_for_test(&self, tokens: TokenSet) {
-        *self.inner.tokens.write().unwrap() = Some(tokens);
+        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(tokens));
     }
 
     /// 直接注入 OAuth server 元数据（测试用，绕过 discover）。

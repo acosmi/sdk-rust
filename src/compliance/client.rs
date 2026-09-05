@@ -51,8 +51,8 @@ use crate::compliance::timestamp::{
 use crate::compliance::types::{CompliancePollOptions, ComplianceWriteOptions};
 use crate::core::client::Client;
 use crate::core::http::{
-    parse_http_error_with_retry_after, read_limited_text, DEFAULT_JSON_TIMEOUT_MS,
-    MAX_ERROR_BODY_SIZE,
+    parse_http_error_with_retry_after, read_limited_text_result as read_limited_text,
+    DEFAULT_JSON_TIMEOUT_MS, MAX_ERROR_BODY_SIZE,
 };
 use crate::shared::pagination::PageRequest;
 use crate::shared::{ApiResponse, Error, Result};
@@ -1266,7 +1266,14 @@ impl Client {
             }
 
             let resp = self
-                .do_request(method.clone(), &url, &headers, body, signal)
+                .do_request(
+                    method.clone(),
+                    &url,
+                    &headers,
+                    body,
+                    signal,
+                    crate::core::transport::HttpContext::default(),
+                )
                 .await?;
 
             if resp.status().as_u16() == 401 && retry_on_401 && !retried {
@@ -1323,7 +1330,14 @@ impl Client {
         }
 
         let resp = self
-            .do_request(reqwest::Method::GET, &url, &headers, None, ctl.as_ref())
+            .do_request(
+                reqwest::Method::GET,
+                &url,
+                &headers,
+                None,
+                ctl.as_ref(),
+                crate::core::transport::HttpContext::default(),
+            )
             .await?;
 
         if !resp.status().is_success() {

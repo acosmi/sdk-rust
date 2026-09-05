@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -9,11 +10,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,3 +42,15 @@ jobs:
 
       - name: Build (no default features)
         run: cargo build --no-default-features
+
+      - name: Build (all features)
+        run: cargo build --all-features
+
+      - name: Check MSRV with compatible dependency resolution
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install 1.82.0 --profile minimal
+          # ICU 2's newest transitive constraints exceed the public MSRV.
+          # Verify source compatibility against the compatible ICU 1.5 graph.
+          cargo update -p idna_adapter --precise 1.2.0
+          cargo +1.82.0 check --locked --all-features

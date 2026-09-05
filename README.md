@@ -7,7 +7,7 @@
 
 ## 状态
 
-- 端口自 [`@acosmi/sdk-ts`](https://github.com/acosmi/sdk-ts)（事实标准主实现）。当前对齐 **v2.17.0**（桌面 loopback OAuth state 语义与 TS 2.17.0 同契约），18 业务域全覆盖。
+- 端口自 [`@acosmi/sdk-ts`](https://github.com/acosmi/sdk-ts)（事实标准主实现）。当前 Rust **v3.0.0** 补齐已核验的 TS 2.19 模型网关观察与目录契约；详细范围和迁移见 [3.0 迁移说明](./docs/transport-and-observers.md)。
 - 仅原生运行时（`tokio` + `reqwest`，rustls TLS）；不提供 WASM/浏览器并列构建。
 - 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 - API 参考由 `cargo doc` / [docs.rs](https://docs.rs/acosmi-sdk) 从 `///` 自动生成（Rust 生态惯例，无手写 API 目录）。
@@ -16,7 +16,7 @@
 
 ```toml
 [dependencies]
-acosmi-sdk = "2.17"
+acosmi-sdk = "3.0"
 tokio = { version = "1", features = ["full"] }
 ```
 

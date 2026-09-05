@@ -73,7 +73,7 @@ impl Client {
         timeout_ms: u64,
     ) -> Result<T> {
         let (bytes, _) = self
-            .do_json_full_raw(reqwest::Method::POST, path, body, signal, timeout_ms)
+            .do_json_full_raw(reqwest::Method::POST, path, body, signal, timeout_ms, None)
             .await?;
         if bytes.is_empty() {
             return Err(Error::other(format!("{path}: empty response body")));

@@ -111,7 +111,7 @@ impl TokenStore for FileTokenStore {
             .parent()
             .ok_or_else(|| Error::other("token path has no parent dir"))?
             .to_path_buf();
-        let data = serde_json::to_vec_pretty(tokens)?;
+        let data = zeroize::Zeroizing::new(serde_json::to_vec_pretty(tokens)?);
         let p2 = p.clone();
         // 阻塞 fs（atomic rename + fsync）放进 blocking 线程池。
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -158,6 +158,7 @@ impl TokenStore for FileTokenStore {
         };
         // 损坏 / 截断 / 缺字段 / 旧版本残留 → 当作无 token（返 None），不报错。
         // serde 反序列化到非可选 String 字段天然等价 TS isValidTokenSet。
+        let data = zeroize::Zeroizing::new(data);
         Ok(serde_json::from_slice::<TokenSet>(&data).ok())
     }
 
@@ -281,7 +282,7 @@ fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File>
 /// 内存 token 存储（进程重启即丢失）。适合测试 / 短期调用 / 不落盘场景。
 #[derive(Default)]
 pub struct InMemoryTokenStore {
-    tokens: std::sync::Mutex<Option<TokenSet>>,
+    tokens: std::sync::Mutex<Option<zeroize::Zeroizing<TokenSet>>>,
 }
 
 impl InMemoryTokenStore {
@@ -293,11 +294,11 @@ impl InMemoryTokenStore {
 #[async_trait]
 impl TokenStore for InMemoryTokenStore {
     async fn save(&self, tokens: &TokenSet) -> Result<()> {
-        *self.tokens.lock().unwrap() = Some(tokens.clone());
+        *self.tokens.lock().unwrap() = Some(zeroize::Zeroizing::new(tokens.clone()));
         Ok(())
     }
     async fn load(&self) -> Result<Option<TokenSet>> {
-        Ok(self.tokens.lock().unwrap().clone())
+        Ok(self.tokens.lock().unwrap().as_ref().map(|t| (**t).clone()))
     }
     async fn clear(&self) -> Result<()> {
         *self.tokens.lock().unwrap() = None;

@@ -100,6 +100,9 @@ struct StreamTicket {
 impl Client {
     /// 建立 WebSocket 长连接 —— 等待首次连接成功或 abort。对应 TS `connect`。
     pub async fn connect(&self, cfg: WSConfig, signal: Option<CancellationToken>) -> Result<()> {
+        if self.http().is_custom() {
+            return Err(crate::core::transport::TransportError::UnsupportedWebSocket.into());
+        }
         // 幂等化重复 connect：先优雅断开旧连接（防 ws-reconnect-leak）。
         self.disconnect().await;
 
@@ -185,6 +188,7 @@ impl Client {
                 None,
                 Some(abort.clone()),
                 DEFAULT_JSON_TIMEOUT_MS,
+                None,
             )
             .await?;
         let env: ApiResponse<StreamTicket> = serde_json::from_slice(&bytes)
