@@ -183,7 +183,7 @@ impl Client {
         // 鉴权 —— 一次性 stream ticket 流程。
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 "/ws/stream-ticket",
                 None,
                 Some(abort.clone()),

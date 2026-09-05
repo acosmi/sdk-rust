@@ -3,10 +3,11 @@ use crate::shared::errors::{Error, NetworkError, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use reqwest::{header::HeaderMap, Method, StatusCode, Url};
+use http::{header::HeaderMap, Method, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{fmt, pin::Pin, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 /// Diagnostic metadata, never an authorization grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,16 +142,21 @@ pub trait HttpTransport: Send + Sync {
 /// HTTP handle for the `*_with_transport` OAuth free functions. Clones share the
 /// transport. This handle never falls back to direct networking in custom mode.
 #[derive(Clone)]
+enum Backend {
+    Custom(Arc<dyn HttpTransport>),
+    #[cfg(feature = "native-http")]
+    Native(reqwest::Client),
+}
+
+#[derive(Clone)]
 pub struct HttpClient {
-    builder: reqwest::Client,
-    custom: Option<Arc<dyn HttpTransport>>,
+    backend: Backend,
     signal: Option<CancellationToken>,
 }
 impl HttpClient {
     pub fn new(transport: Arc<dyn HttpTransport>) -> Self {
         Self {
-            builder: reqwest::Client::new(),
-            custom: Some(transport),
+            backend: Backend::Custom(transport),
             signal: None,
         }
     }
@@ -160,19 +166,35 @@ impl HttpClient {
             ..self.clone()
         }
     }
+    #[cfg(feature = "native-http")]
     pub(crate) fn legacy(builder: reqwest::Client) -> Self {
         Self {
-            builder,
-            custom: None,
+            backend: Backend::Native(builder),
             signal: None,
         }
     }
+    #[cfg(feature = "notifications-ws")]
     pub(crate) fn is_custom(&self) -> bool {
-        self.custom.is_some()
+        matches!(self.backend, Backend::Custom(_))
     }
     pub(crate) fn request(&self, method: Method, url: &str) -> HttpRequestBuilder {
+        let inner = match &self.backend {
+            Backend::Custom(_) => RequestKind::Custom(
+                Url::parse(url)
+                    .map(|url| HttpRequest {
+                        method,
+                        url,
+                        headers: HeaderMap::new(),
+                        body: Vec::new(),
+                        context: HttpContext::default(),
+                    })
+                    .map_err(|_| TransportError::InvalidRequest),
+            ),
+            #[cfg(feature = "native-http")]
+            Backend::Native(client) => RequestKind::Native(client.request(method, url)),
+        };
         HttpRequestBuilder {
-            inner: self.builder.request(method, url),
+            inner,
             client: self.clone(),
             context: HttpContext::default(),
         }
@@ -184,9 +206,18 @@ impl HttpClient {
         self.request(Method::POST, url)
     }
 }
-
+enum RequestKind {
+    Custom(std::result::Result<HttpRequest, TransportError>),
+    #[cfg(feature = "native-http")]
+    Native(reqwest::RequestBuilder),
+}
+enum PreparedRequest {
+    Custom(HttpRequest),
+    #[cfg(feature = "native-http")]
+    Native(reqwest::Request),
+}
 pub(crate) struct HttpRequestBuilder {
-    inner: reqwest::RequestBuilder,
+    inner: RequestKind,
     client: HttpClient,
     context: HttpContext,
 }
@@ -209,28 +240,73 @@ impl HttpRequestBuilder {
     }
     pub(crate) fn header<K, V>(mut self, key: K, value: V) -> Self
     where
-        reqwest::header::HeaderName: TryFrom<K>,
-        <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
-        reqwest::header::HeaderValue: TryFrom<V>,
-        <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+        http::header::HeaderName: TryFrom<K>,
+        <http::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        http::header::HeaderValue: TryFrom<V>,
+        <http::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
     {
-        self.inner = self.inner.header(key, value);
+        self.inner = match self.inner {
+            RequestKind::Custom(request) => RequestKind::Custom(request.and_then(|mut r| {
+                let key = http::header::HeaderName::try_from(key)
+                    .map_err(|_| TransportError::InvalidRequest)?;
+                let mut value = http::header::HeaderValue::try_from(value)
+                    .map_err(|_| TransportError::InvalidRequest)?;
+                value.set_sensitive(true);
+                r.headers.append(key, value);
+                Ok(r)
+            })),
+            #[cfg(feature = "native-http")]
+            RequestKind::Native(r) => RequestKind::Native(r.header(key, value)),
+        };
         self
     }
     pub(crate) fn body(mut self, body: String) -> Self {
-        self.inner = self.inner.body(body);
+        self.inner = match self.inner {
+            RequestKind::Custom(r) => RequestKind::Custom(r.map(|mut r| {
+                r.body = body.into_bytes();
+                r
+            })),
+            #[cfg(feature = "native-http")]
+            RequestKind::Native(r) => RequestKind::Native(r.body(body)),
+        };
         self
     }
     pub(crate) fn json<T: Serialize + ?Sized>(mut self, body: &T) -> Self {
-        self.inner = self.inner.json(body);
+        self.inner = match self.inner {
+            RequestKind::Custom(r) => RequestKind::Custom(r.and_then(|mut r| {
+                r.body = serde_json::to_vec(body).map_err(|_| TransportError::InvalidRequest)?;
+                r.headers
+                    .entry(http::header::CONTENT_TYPE)
+                    .or_insert(http::header::HeaderValue::from_static("application/json"));
+                Ok(r)
+            })),
+            #[cfg(feature = "native-http")]
+            RequestKind::Native(r) => RequestKind::Native(r.json(body)),
+        };
         self
     }
     pub(crate) fn form<T: Serialize + ?Sized>(mut self, body: &T) -> Self {
-        self.inner = self.inner.form(body);
+        self.inner = match self.inner {
+            RequestKind::Custom(r) => RequestKind::Custom(r.and_then(|mut r| {
+                r.body = serde_urlencoded::to_string(body)
+                    .map_err(|_| TransportError::InvalidRequest)?
+                    .into_bytes();
+                r.headers.entry(http::header::CONTENT_TYPE).or_insert(
+                    http::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
+                );
+                Ok(r)
+            })),
+            #[cfg(feature = "native-http")]
+            RequestKind::Native(r) => RequestKind::Native(r.form(body)),
+        };
         self
     }
+    #[cfg(feature = "native-http")]
     pub(crate) fn multipart(mut self, body: reqwest::multipart::Form) -> Self {
-        self.inner = self.inner.multipart(body);
+        self.inner = match self.inner {
+            RequestKind::Custom(_) => RequestKind::Custom(Err(TransportError::UnsupportedBody)),
+            RequestKind::Native(r) => RequestKind::Native(r.multipart(body)),
+        };
         self
     }
 
@@ -243,62 +319,62 @@ impl HttpRequestBuilder {
             .unwrap_or_default();
         let guard = cancel.clone().drop_guard();
         let deadline = tokio::time::Instant::now() + self.context.timeout;
-        let mut request = self
-            .inner
-            .build()
-            .map_err(|_| TransportError::InvalidRequest)?;
-        // Mark all outgoing header values sensitive before handing them to HTTP libraries.
-        for value in request.headers_mut().values_mut() {
-            value.set_sensitive(true);
-        }
+        let request = match self.inner {
+            RequestKind::Custom(request) => {
+                let mut request = request?;
+                request.context = self.context;
+                PreparedRequest::Custom(request)
+            }
+            #[cfg(feature = "native-http")]
+            RequestKind::Native(request) => {
+                let mut request = request
+                    .build()
+                    .map_err(|_| TransportError::InvalidRequest)?;
+                for value in request.headers_mut().values_mut() {
+                    value.set_sensitive(true);
+                }
+                PreparedRequest::Native(request)
+            }
+        };
         let send = async {
-            if let Some(custom) = &self.client.custom {
-                let body = match request.body() {
-                    None => Vec::new(),
-                    Some(body) => body
-                        .as_bytes()
-                        .ok_or(TransportError::UnsupportedBody)?
-                        .to_vec(),
-                };
-                let owned = HttpRequest {
-                    method: request.method().clone(),
-                    url: request.url().clone(),
-                    headers: request.headers().clone(),
-                    body,
-                    context: self.context,
-                };
-                drop(request);
-                let response = custom
-                    .execute(owned, cancel.clone())
-                    .await
-                    .map_err(Error::from)?;
-                Ok::<_, Error>((
-                    response.status,
-                    response.headers,
-                    Box::pin(response.body.map(|v| v.map_err(Error::from))) as ResponseBody,
-                ))
-            } else {
-                let response = self.client.builder.execute(request).await.map_err(|e| {
-                    if e.is_timeout() {
-                        Error::from(TransportError::Timeout)
-                    } else if e.is_connect() {
-                        Error::from(TransportError::Connection)
-                    } else {
-                        Error::from(TransportError::Rejected)
-                    }
-                })?;
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body = response.bytes_stream().map(|v| {
-                    v.map_err(|e| {
+            match (&self.client.backend, request) {
+                (Backend::Custom(custom), PreparedRequest::Custom(request)) => {
+                    let response = custom
+                        .execute(request, cancel.clone())
+                        .await
+                        .map_err(Error::from)?;
+                    Ok::<_, Error>((
+                        response.status,
+                        response.headers,
+                        Box::pin(response.body.map(|v| v.map_err(Error::from))) as ResponseBody,
+                    ))
+                }
+                #[cfg(feature = "native-http")]
+                (Backend::Native(client), PreparedRequest::Native(request)) => {
+                    let response = client.execute(request).await.map_err(|e| {
                         if e.is_timeout() {
-                            TransportError::Timeout.into()
+                            TransportError::Timeout
+                        } else if e.is_connect() {
+                            TransportError::Connection
                         } else {
-                            TransportError::Body.into()
+                            TransportError::Rejected
                         }
-                    })
-                });
-                Ok((status, headers, Box::pin(body) as ResponseBody))
+                    })?;
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    let body = response.bytes_stream().map(|v| {
+                        v.map_err(|e| {
+                            if e.is_timeout() {
+                                TransportError::Timeout.into()
+                            } else {
+                                TransportError::Body.into()
+                            }
+                        })
+                    });
+                    Ok((status, headers, Box::pin(body) as ResponseBody))
+                }
+                #[cfg(feature = "native-http")]
+                _ => Err(TransportError::InvalidRequest.into()),
             }
         };
         let (status, headers, mut body) = tokio::select! {

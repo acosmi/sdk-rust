@@ -25,7 +25,7 @@ pub struct ChatOptions {
 /// Read a single bounded ASCII identifier. No fallback or synthesized ID.
 /// Surrounding HTTP whitespace is trimmed; duplicates, control/non-ASCII bytes,
 /// embedded whitespace, commas and values over 256 bytes are rejected.
-pub fn read_gateway_request_id(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+pub fn read_gateway_request_id(headers: &http::header::HeaderMap) -> Option<&str> {
     let mut values = headers.get_all(GATEWAY_REQUEST_ID_HEADER).iter();
     let value = values.next()?.to_str().ok()?.trim();
     if values.next().is_some()
@@ -49,7 +49,7 @@ impl ChatOptions {
         }
     }
 
-    pub(crate) fn response(&mut self, headers: &reqwest::header::HeaderMap) {
+    pub(crate) fn response(&mut self, headers: &http::header::HeaderMap) {
         if let (Some(callback), Some(id)) = (
             self.on_gateway_request_id.take(),
             read_gateway_request_id(headers),

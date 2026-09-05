@@ -388,7 +388,7 @@ pub async fn exchange_code_with_transport(
     post_token(http, &meta.token_endpoint, &params).await
 }
 
-/// 与 [`exchange_code`] 相同，但附带 `expires_in` 参数（setup-token 模式）。
+/// 与 [`exchange_code_with_transport`] 相同，但附带 `expires_in` 参数（setup-token 模式）。
 /// 对应 TS `exchangeCodeWithExpiry`（TS barrel 漏 re-export，此处补齐导出）。
 pub async fn exchange_code_with_expiry_with_transport(
     http: &HttpClient,
@@ -1021,6 +1021,7 @@ mod loopback {
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn discover_with_profile(
     http: &reqwest::Client,
     server_url: &str,
@@ -1031,6 +1032,7 @@ pub async fn discover_with_profile(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn discover_web_oauth_metadata(
     http: &reqwest::Client,
     server_url: &str,
@@ -1039,6 +1041,7 @@ pub async fn discover_web_oauth_metadata(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn register(
     http: &reqwest::Client,
     meta: &ServerMetadata,
@@ -1048,6 +1051,7 @@ pub async fn register(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn register_web_oauth_client(
     http: &reqwest::Client,
     meta: &ServerMetadata,
@@ -1057,6 +1061,7 @@ pub async fn register_web_oauth_client(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn exchange_code(
     http: &reqwest::Client,
     meta: &ServerMetadata,
@@ -1077,6 +1082,7 @@ pub async fn exchange_code(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn exchange_code_with_expiry(
     http: &reqwest::Client,
     meta: &ServerMetadata,
@@ -1099,6 +1105,7 @@ pub async fn exchange_code_with_expiry(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn refresh_token(
     http: &reqwest::Client,
     meta: &ServerMetadata,
@@ -1115,6 +1122,7 @@ pub async fn refresh_token(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn revoke_token(
     http: &reqwest::Client,
     meta: &ServerMetadata,
@@ -1124,6 +1132,7 @@ pub async fn revoke_token(
 }
 
 /// Compatibility entry point using the supplied reqwest client.
+#[cfg(feature = "native-http")]
 pub async fn complete_web_authorization_request(
     http: &reqwest::Client,
     pending: &WebAuthorizationPending,
@@ -1146,6 +1155,7 @@ impl std::fmt::Debug for OAuthTokenEndpointError {
 }
 
 /// Discover using the supplied reqwest client (legacy compatible entry point).
+#[cfg(feature = "native-http")]
 pub async fn discover(http: &reqwest::Client, server_url: &str) -> Result<ServerMetadata> {
     discover_with_transport(&HttpClient::legacy(http.clone()), server_url).await
 }

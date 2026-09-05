@@ -46,6 +46,17 @@ jobs:
       - name: Build (all features)
         run: cargo build --all-features
 
+      - name: Pure custom transport checks
+        run: |
+          cargo clippy --no-default-features --features custom-transport,sanitize,desktop-loopback --all-targets -- -D warnings
+          cargo test --no-default-features --features custom-transport,sanitize,desktop-loopback
+          cargo doc --no-deps --no-default-features --features custom-transport,sanitize,desktop-loopback
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Isolated custom graph and zeroize 1.9 consumer
+        run: python3 .github/scripts/check-custom-consumer.py
+
       - name: Check MSRV with compatible dependency resolution
         if: runner.os == 'Linux'
         run: |
@@ -53,4 +64,6 @@ jobs:
           # ICU 2's newest transitive constraints exceed the public MSRV.
           # Verify source compatibility against the compatible ICU 1.5 graph.
           cargo update -p idna_adapter --precise 1.2.0
+          cargo update -p zeroize --precise 1.8.2
           cargo +1.82.0 check --locked --all-features
+          cargo +1.82.0 check --locked --no-default-features --features custom-transport,sanitize,desktop-loopback

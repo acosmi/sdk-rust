@@ -73,7 +73,7 @@ fn production_region(src: &str) -> String {
     let normalized = src.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.split('\n').collect();
     for (i, line) in lines.iter().enumerate() {
-        if line.trim() != "#[cfg(test)]" {
+        if line.trim() != "#[cfg(test)]" && !line.trim().starts_with("#[cfg(all(test,") {
             continue;
         }
         let next = lines[i + 1..].iter().find(|l| !l.trim().is_empty());

@@ -1,3 +1,4 @@
+#![cfg(feature = "native-http")]
 #![cfg(feature = "desktop-loopback")]
 //! p2_auth_loopback_state — 桌面 loopback OAuth state + 常驻多连接稳健性矩阵
 //! (2026-08-15, 与 TS test/auth/desktop-loopback-state.test.ts / Go

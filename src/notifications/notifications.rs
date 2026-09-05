@@ -41,7 +41,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<()> {
         self.notify_void(
-            reqwest::Method::PUT,
+            http::Method::PUT,
             &format!("/notifications/{}/read", urlencoding(id)),
             None,
             signal,
@@ -54,13 +54,8 @@ impl Client {
         &self,
         signal: Option<CancellationToken>,
     ) -> Result<()> {
-        self.notify_void(
-            reqwest::Method::PUT,
-            "/notifications/read-all",
-            None,
-            signal,
-        )
-        .await
+        self.notify_void(http::Method::PUT, "/notifications/read-all", None, signal)
+            .await
     }
 
     /// 删除通知。对应 TS `deleteNotification`。
@@ -70,7 +65,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<()> {
         self.notify_void(
-            reqwest::Method::DELETE,
+            http::Method::DELETE,
             &format!("/notifications/{}", urlencoding(id)),
             None,
             signal,
@@ -89,13 +84,8 @@ impl Client {
     ) -> Result<()> {
         let body = serde_json::to_string(reg)
             .map_err(|e| Error::other(format!("serialize device registration: {e}")))?;
-        self.notify_void(
-            reqwest::Method::POST,
-            "/devices/register",
-            Some(&body),
-            signal,
-        )
-        .await
+        self.notify_void(http::Method::POST, "/devices/register", Some(&body), signal)
+            .await
     }
 
     /// 注销推送设备 token。对应 TS `unregisterDevice`。
@@ -107,7 +97,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<()> {
         self.notify_void(
-            reqwest::Method::DELETE,
+            http::Method::DELETE,
             &format!("/devices/{}", urlencoding(token)),
             None,
             signal,
@@ -137,7 +127,7 @@ impl Client {
         let body = serde_json::to_string(pref)
             .map_err(|e| Error::other(format!("serialize preference: {e}")))?;
         self.notify_void(
-            reqwest::Method::PUT,
+            http::Method::PUT,
             &format!("/notification-preferences/{}", urlencoding(type_code)),
             Some(&body),
             signal,
@@ -149,7 +139,7 @@ impl Client {
     /// 对应 TS `doJSON<APIResponse<unknown>>(...)`（忽略 data）。
     async fn notify_void(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<CancellationToken>,

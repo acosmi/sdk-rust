@@ -27,7 +27,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<T>>(reqwest::Method::GET, path, None, signal)
+            .do_json_full::<ApiResponse<T>>(http::Method::GET, path, None, signal)
             .await?;
         unwrap_commerce(path, env)
     }
@@ -42,7 +42,7 @@ impl Client {
         // 空 data 字段在 ApiResponse<Vec<T>> 下会反序列化失败（data 必填）；这里用宽容包装：
         // 先取 ApiResponse<Option<Vec<T>>> 把 null/缺省吸收为 None → [].
         let (env, _) = self
-            .do_json_full::<ApiResponse<Option<Vec<T>>>>(reqwest::Method::GET, path, None, signal)
+            .do_json_full::<ApiResponse<Option<Vec<T>>>>(http::Method::GET, path, None, signal)
             .await?;
         match env {
             Some(env) => {
@@ -64,7 +64,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<T>>(reqwest::Method::POST, path, body, signal)
+            .do_json_full::<ApiResponse<T>>(http::Method::POST, path, body, signal)
             .await?;
         unwrap_commerce(path, env)
     }
@@ -78,7 +78,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<Option<T>> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<Option<T>>>(reqwest::Method::POST, path, body, signal)
+            .do_json_full::<ApiResponse<Option<T>>>(http::Method::POST, path, body, signal)
             .await?;
         match env {
             Some(env) => {
@@ -98,7 +98,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<Option<T>> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<Option<T>>>(reqwest::Method::GET, path, None, signal)
+            .do_json_full::<ApiResponse<Option<T>>>(http::Method::GET, path, None, signal)
             .await?;
         match env {
             Some(env) => {
@@ -120,12 +120,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<()> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<serde_json::Value>>(
-                reqwest::Method::POST,
-                path,
-                body,
-                signal,
-            )
+            .do_json_full::<ApiResponse<serde_json::Value>>(http::Method::POST, path, body, signal)
             .await?;
         if let Some(env) = env {
             if let Some(err) = env.business_error() {
@@ -144,7 +139,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<bool> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<Option<bool>>>(reqwest::Method::POST, path, body, signal)
+            .do_json_full::<ApiResponse<Option<bool>>>(http::Method::POST, path, body, signal)
             .await?;
         match env {
             Some(env) => {

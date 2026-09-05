@@ -30,7 +30,7 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         let (env, _) = self
-            .do_json_full::<ApiResponse<T>>(reqwest::Method::GET, path, None, signal)
+            .do_json_full::<ApiResponse<T>>(http::Method::GET, path, None, signal)
             .await?;
         unwrap_billing(path, env)
     }
@@ -73,7 +73,7 @@ impl Client {
         timeout_ms: u64,
     ) -> Result<T> {
         let (bytes, _) = self
-            .do_json_full_raw(reqwest::Method::POST, path, body, signal, timeout_ms, None)
+            .do_json_full_raw(http::Method::POST, path, body, signal, timeout_ms, None)
             .await?;
         if bytes.is_empty() {
             return Err(Error::other(format!("{path}: empty response body")));

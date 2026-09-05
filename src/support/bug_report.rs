@@ -123,7 +123,7 @@ impl Client {
         let body = json!({ "content": content_str }).to_string();
         let (raw, _) = self
             .do_json_full::<Value>(
-                reqwest::Method::POST,
+                http::Method::POST,
                 "/crabcode_cli_feedback",
                 Some(&body),
                 signal,

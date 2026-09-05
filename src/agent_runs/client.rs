@@ -295,12 +295,12 @@ impl AgentRunsClient {
             .await?;
         let content_type = resp
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let filename = filename_from_content_disposition(
             resp.headers()
-                .get(reqwest::header::CONTENT_DISPOSITION)
+                .get(http::header::CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok()),
         )
         .unwrap_or_else(|| artifact_id.to_string());
@@ -676,18 +676,15 @@ impl Client {
     ) -> Result<crate::core::transport::Response> {
         let token = self.ensure_token(signal.cloned()).await?;
         let url = self.api_url(path);
-        let m = reqwest::Method::from_bytes(method.as_bytes())
+        let m = http::Method::from_bytes(method.as_bytes())
             .map_err(|e| Error::other(format!("invalid method {method}: {e}")))?;
 
-        let mut headers: Vec<(reqwest::header::HeaderName, String)> = vec![
-            (reqwest::header::AUTHORIZATION, format!("Bearer {token}")),
-            (reqwest::header::ACCEPT, accept.to_string()),
+        let mut headers: Vec<(http::header::HeaderName, String)> = vec![
+            (http::header::AUTHORIZATION, format!("Bearer {token}")),
+            (http::header::ACCEPT, accept.to_string()),
         ];
         if body.is_some() {
-            headers.push((
-                reqwest::header::CONTENT_TYPE,
-                "application/json".to_string(),
-            ));
+            headers.push((http::header::CONTENT_TYPE, "application/json".to_string()));
         }
 
         // 🔴 流式安全：只走单次 do_request（绝不 do_request_with_retry）。
@@ -1389,9 +1386,9 @@ fn percent_decode(s: &str) -> String {
 }
 
 // `parse_retry_after_secs` 仅 client.rs 内私有；这里复刻最小版（agent-runs 自有 raw 路径用）。
-fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> i64 {
+fn parse_retry_after_secs(headers: &http::header::HeaderMap) -> i64 {
     headers
-        .get(reqwest::header::RETRY_AFTER)
+        .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|&s| s > 0)

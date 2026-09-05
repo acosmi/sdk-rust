@@ -21,23 +21,13 @@ pub use types::{
 // === Auth helpers（对齐 auth/index.ts barrel；含 TS barrel 漏掉的 exchange_code_with_expiry）===
 pub use auth::{
     code_challenge,
-    complete_web_authorization_request,
     create_web_authorization_request,
-    discover,
-    discover_web_oauth_metadata,
-    discover_with_profile,
-    exchange_code,
-    exchange_code_with_expiry,
     generate_code_verifier,
     generate_state,
     is_invalid_grant_error,
     is_ssl_error,
     new_token_set,
-    refresh_token,
-    register,
-    register_web_oauth_client,
     resolve_success_redirect,
-    revoke_token,
     AuthorizeResult,
     CreateWebAuthorizationRequestOptions,
     LoginEvent,
@@ -83,3 +73,9 @@ pub use crate::auth::auth::{
 };
 
 pub use crate::auth::auth::discover_with_transport;
+#[cfg(feature = "native-http")]
+pub use crate::auth::auth::{
+    complete_web_authorization_request, discover, discover_web_oauth_metadata,
+    discover_with_profile, exchange_code, exchange_code_with_expiry, refresh_token, register,
+    register_web_oauth_client, revoke_token,
+};

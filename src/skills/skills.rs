@@ -128,7 +128,7 @@ impl Client {
     /// 下载技能 ZIP 包（公共端点，双模式）。对应 TS `downloadSkill`。
     ///
     /// 有 token 时自动附带（享受无限流），无 token 时匿名（受限流）。
-    /// 50MB 上限走 [`MAX_DOWNLOAD_SIZE`] + [`crate::core::http::read_limited`]；限流时抛 [`Error::RateLimit`]。
+    /// 50MB 上限走 [`MAX_DOWNLOAD_SIZE`] + [`crate::core::http::read_limited_result`]；限流时抛 [`Error::RateLimit`]。
     pub async fn download_skill(
         &self,
         skill_id: &str,
@@ -147,9 +147,15 @@ impl Client {
                 SKILL_TRANSFER_TIMEOUT_MS,
             ),
         );
-        if let Ok(token) = self.ensure_token(ctl.clone()).await {
+        let token_result = self.ensure_token(ctl.clone()).await;
+        let token_result = if self.uses_strict_authority() {
+            Ok(token_result?)
+        } else {
+            token_result
+        };
+        if let Ok(token) = token_result {
             if !token.is_empty() {
-                rb = rb.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+                rb = rb.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
             }
         }
 
@@ -166,7 +172,7 @@ impl Client {
         if status.as_u16() == 429 {
             let retry_after = resp
                 .headers()
-                .get(reqwest::header::RETRY_AFTER)
+                .get(http::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
@@ -213,6 +219,19 @@ impl Client {
             .await
     }
 
+    #[cfg(not(feature = "native-http"))]
+    async fn upload_skill_internal(
+        &self,
+        _data: &[u8],
+        _scope: &str,
+        _intent: &str,
+        _retried: bool,
+        _signal: Option<CancellationToken>,
+    ) -> Result<SkillStoreItem> {
+        Err(crate::core::TransportError::UnsupportedBody.into())
+    }
+
+    #[cfg(feature = "native-http")]
     async fn upload_skill_internal(
         &self,
         zip_data: &[u8],
@@ -243,7 +262,7 @@ impl Client {
                 crate::core::transport::HttpPurpose::Transfer,
                 SKILL_TRANSFER_TIMEOUT_MS,
             ))
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
             .multipart(form)
             .send();
         let resp = match &ctl {
@@ -376,6 +395,7 @@ impl Client {
 
 /// 上传响应内层 `data.skill`。
 #[derive(serde::Deserialize)]
+#[cfg(feature = "native-http")]
 struct UploadData {
     skill: SkillStoreItem,
 }
@@ -418,10 +438,10 @@ fn build_skill_query(
 }
 
 /// 从 `Content-Disposition` 头提取 filename（对应 TS 的简易解析；默认 `skill.zip`）。
-fn parse_content_disposition_filename(headers: &reqwest::header::HeaderMap) -> String {
+fn parse_content_disposition_filename(headers: &http::header::HeaderMap) -> String {
     let default = "skill.zip".to_string();
     let cd = match headers
-        .get(reqwest::header::CONTENT_DISPOSITION)
+        .get(http::header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
     {
         Some(s) => s,

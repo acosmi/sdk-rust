@@ -1,4 +1,4 @@
-use acosmi::core::http::iter_sse_lines_with_cap;
+use acosmi::core::http::iter_sse_lines_result_with_cap as iter_sse_lines_with_cap;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
 

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [4.0.0] - 2026-09-05 — Custom-only dependency graph and strict token authority
+
+### Breaking feature migration
+
+- Native HTTP/multipart and notification WebSocket dependencies are now optional native-http / notifications-ws features, both enabled by default. Existing default-features=false consumers must enable these features explicitly to retain the native APIs. Without native-http, Config.http, reqwest OAuth helpers and Error::Http2 are absent; without notifications-ws, the WebSocket API is absent. Client::new/create require a transport constructor when native-http is disabled.
+- The default API remains available. Both model wire adapters stay compiled independently of networking features.
+
+### Added
+
+- A pure custom-transport build uses http/url types and directly encoded JSON/forms without creating a reqwest client. An isolated consumer gate proves no SDK reqwest, Hyper, TLS or WebSocket stack in its normal dependency graph.
+- StrictTokenAuthority with required lock, Ready/Missing/RotationPending states, durable begin_rotation/commit_rotation/clear operations, Client::create_with_authority and read-only reconcile_authority.
+- Strict mode reloads even unexpired tokens, fails closed on missing/error states, persists Pending before OAuth token effects, and publishes tokens only after confirmed commit and matching readback. Unknown results and cancellation block use and automatic refresh. Recreated clients reject persisted Pending.
+- Strict login/logout use the same authority boundary; Config.store is never a fallback. Legacy TokenStore tolerance is explicitly unchanged.
+
+### Fixed
+
+- zeroize now accepts the compatible 1.8.2 range. An exact 1.9.0 consumer is tested alongside locked Rust 1.82 builds using 1.8.2.
+
+The host implements actual durable transactions, CAS, actor/revision fencing and uncertain-state reconciliation. SDK tests establish ordering and failures, not durability of arbitrary authority implementations. See [4.0 integration and migration](./docs/strict-authority.md).
+
 ## [3.0.0] - 2026-09-05 — Custom HTTP transport and model gateway observers
 
 ### Compatibility

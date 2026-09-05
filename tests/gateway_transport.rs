@@ -3,7 +3,7 @@ use acosmi::*;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
-use reqwest::{header::HeaderMap, StatusCode};
+use http::{header::HeaderMap, StatusCode};
 use std::{
     collections::VecDeque,
     sync::{
@@ -387,8 +387,11 @@ async fn custom_redirect_is_not_followed_and_unsupported_paths_do_not_connect() 
     let (c, m) = client(vec![redirect], false).await;
     assert!(c.list_models(None, false).await.is_err());
     assert_eq!(m.requests.lock().unwrap().len(), 1);
-    let e = c.connect(Default::default(), None).await.unwrap_err();
-    assert!(e.to_string().contains("unsupported_websocket"));
+    #[cfg(feature = "notifications-ws")]
+    {
+        let e = c.connect(Default::default(), None).await.unwrap_err();
+        assert!(e.to_string().contains("unsupported_websocket"));
+    }
     assert!(c
         .upload_skill(vec![], "private", "install", None)
         .await

@@ -3,7 +3,9 @@
 //! 含：安全限制常量 / `parse_http_error`（Anthropic + OpenAI 错误体）/ `classify_transport`
 //! （NetworkError 分类）/ `parse_stream_error`（三 schema）/ 订单状态判定 / SSE 行扫描器 / 限长读取。
 
-use crate::shared::errors::{HttpError, NetworkError, Result, StreamError};
+#[cfg(feature = "native-http")]
+use crate::shared::errors::NetworkError;
+use crate::shared::errors::{HttpError, Result, StreamError};
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::Stream;
@@ -76,6 +78,7 @@ pub fn parse_http_error_with_retry_after(
 /// - 超时（`is_timeout`）→ `timeout=true`
 /// - 连接重置 / EOF / broken pipe / 连接失败 → `eof=true`
 /// - 其它：`timeout`/`eof` 均 false（不重试）
+#[cfg(feature = "native-http")]
 pub fn classify_transport(op: &str, url: &str, err: &reqwest::Error) -> NetworkError {
     let mut ne = NetworkError::new(op, url, err.to_string());
     if err.is_timeout() {
@@ -197,6 +200,7 @@ pub fn is_order_terminal(status: &str) -> bool {
 /// - 单行 1MB 硬上限（与 [`MAX_SSE_LINE_SIZE`] 对齐）—— 超长行报错。
 /// - 去除行尾 `\r`（CRLF）。
 /// - flush 末行（无结尾 `\n`）。
+#[cfg(feature = "native-http")]
 pub fn iter_sse_lines<S>(body: S) -> impl Stream<Item = Result<String>>
 where
     S: Stream<Item = reqwest::Result<Bytes>>,
@@ -205,6 +209,7 @@ where
 }
 
 /// [`iter_sse_lines`] 带自定义单行上限。
+#[cfg(feature = "native-http")]
 pub fn iter_sse_lines_with_cap<S>(
     body: S,
     max_line_bytes: usize,
@@ -215,14 +220,14 @@ where
     iter_sse_lines_result_with_cap(body.map(|v| v.map_err(Into::into)), max_line_bytes)
 }
 
-pub(crate) fn iter_sse_lines_result<S>(body: S) -> impl Stream<Item = Result<String>>
+pub fn iter_sse_lines_result<S>(body: S) -> impl Stream<Item = Result<String>>
 where
     S: Stream<Item = Result<Bytes>>,
 {
     iter_sse_lines_result_with_cap(body, MAX_SSE_LINE_SIZE)
 }
 
-fn iter_sse_lines_result_with_cap<S>(
+pub fn iter_sse_lines_result_with_cap<S>(
     body: S,
     max_line_bytes: usize,
 ) -> impl Stream<Item = Result<String>>
@@ -279,6 +284,7 @@ where
 // =============================================================================
 
 /// 读取字节流但限制最大字节数，超限丢弃尾部。对应 TS `readLimited`。
+#[cfg(feature = "native-http")]
 pub async fn read_limited<S>(body: S, max_bytes: usize) -> Result<Vec<u8>>
 where
     S: Stream<Item = reqwest::Result<Bytes>>,
@@ -286,7 +292,7 @@ where
     read_limited_result(body.map(|v| v.map_err(Into::into)), max_bytes).await
 }
 
-pub(crate) async fn read_limited_result<S>(body: S, max_bytes: usize) -> Result<Vec<u8>>
+pub async fn read_limited_result<S>(body: S, max_bytes: usize) -> Result<Vec<u8>>
 where
     S: Stream<Item = Result<Bytes>>,
 {
@@ -307,6 +313,7 @@ where
 }
 
 /// 读取字节流 + UTF-8 解码，限制最大字节数。对应 TS `readLimitedText`。
+#[cfg(feature = "native-http")]
 pub async fn read_limited_text<S>(body: S, max_bytes: usize) -> Result<String>
 where
     S: Stream<Item = reqwest::Result<Bytes>>,
@@ -315,7 +322,7 @@ where
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-pub(crate) async fn read_limited_text_result<S>(body: S, max_bytes: usize) -> Result<String>
+pub async fn read_limited_text_result<S>(body: S, max_bytes: usize) -> Result<String>
 where
     S: Stream<Item = Result<Bytes>>,
 {

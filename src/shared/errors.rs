@@ -208,6 +208,7 @@ pub enum Error {
     // ── Rust 传播用工具变体（TS 无对应；用于 `?` 链路）──
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[cfg(feature = "native-http")]
     #[error(transparent)]
     Http2(#[from] reqwest::Error),
     #[error(transparent)]

@@ -1,6 +1,6 @@
 [package]
 name = "acosmi-sdk"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Acosmi Rust SDK：模型网关、Agent Run Gateway 与 Compliance 统一客户端。双格式（Anthropic + OpenAI）。端口自 acosmi-sdk-ts。"
@@ -22,9 +22,10 @@ path = "src/lib.rs"
 #   - 双 adapter（Anthropic + OpenAI）等地位红线，恒编译，不 feature-gate
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_urlencoded = "0.7"
 thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
@@ -33,7 +34,7 @@ tokio-util = "0.7"
 url = "2"
 bytes = "1"
 http = "1"
-zeroize = "=1.8.2"
+zeroize = "1.8.2"
 # chrono：ISO 8601 / RFC3339 解析（token_set_is_expired 过期判断 + new_token_set 时间戳）。
 # 关 default（去掉 oldtime/wasmbind 等无关项），仅留 std + clock（Utc::now）。
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -43,7 +44,7 @@ rand = "0.8"
 base64 = "0.22"
 # notifications WebSocket：长连接（对齐 Go gorilla/websocket）。与 reqwest 同 rustls backend
 # （webpki-roots，无 native-tls），仅这一个 WS dep。futures-util 用于 SinkExt/StreamExt（split + send）。
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.24", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 [dev-dependencies]
@@ -51,8 +52,16 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 # sanitize：历史消息清洗子包（对齐 npm 子路径 ./sanitize），默认开启以保证 lib 完整。
-default = ["sanitize"]
+default = ["sanitize", "native-http", "notifications-ws"]
+# Custom-only builds do not compile or instantiate an SDK networking stack.
+custom-transport = []
+native-http = ["dep:reqwest"]
+notifications-ws = ["dep:tokio-tungstenite", "native-http"]
 sanitize = []
 # desktop-loopback：authorize() 的 loopback HTTP server（桌面 OAuth），按需开启。
 # 2026-08-15 起启用 tokio/net（常驻多连接 accept 循环）；feature 关闭时依赖面不变。
 desktop-loopback = ["tokio/net"]
+
+[[example]]
+name = "oauth_flow"
+required-features = ["native-http"]

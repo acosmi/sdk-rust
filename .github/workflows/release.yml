@@ -44,6 +44,9 @@ jobs:
       - run: cargo build --no-default-features
       - run: cargo build --all-features
 
+      - run: cargo test --no-default-features --features custom-transport,sanitize,desktop-loopback
+      - run: python3 .github/scripts/check-custom-consumer.py
+
       - run: cargo publish --dry-run
 
       - run: cargo publish

@@ -981,7 +981,7 @@ impl ComplianceClient {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         self.client
-            .compliance_execute_json(reqwest::Method::GET, path, body, signal, true, &[])
+            .compliance_execute_json(http::Method::GET, path, body, signal, true, &[])
             .await
     }
 
@@ -1010,7 +1010,7 @@ impl ComplianceClient {
             ),
             None => None,
         };
-        let m = reqwest::Method::from_bytes(method.as_bytes())
+        let m = http::Method::from_bytes(method.as_bytes())
             .map_err(|e| Error::other(format!("invalid method {method}: {e}")))?;
         let extra = idempotency_header(opts);
         self.client
@@ -1034,7 +1034,7 @@ impl ComplianceClient {
             ),
             None => None,
         };
-        let m = reqwest::Method::from_bytes(method.as_bytes())
+        let m = http::Method::from_bytes(method.as_bytes())
             .map_err(|e| Error::other(format!("invalid method {method}: {e}")))?;
         let extra = idempotency_header(opts);
         self.client
@@ -1162,7 +1162,7 @@ impl Client {
     /// 对应 TS `ComplianceClient.executeJson`。空体成功响应（void 端点除外）→ 强 Err。
     pub(crate) async fn compliance_execute_json<T: DeserializeOwned>(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<CancellationToken>,
@@ -1187,7 +1187,7 @@ impl Client {
     /// `write<void>`（`undefined as T`）。
     pub(crate) async fn compliance_execute_unit(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<CancellationToken>,
@@ -1213,7 +1213,7 @@ impl Client {
     /// 401（read）单次 force_refresh 重放 → 非 2xx 抛 HTTPError → 返回 body bytes。
     async fn compliance_execute_bytes(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<CancellationToken>,
@@ -1237,7 +1237,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     fn compliance_execute_bytes_inner<'a>(
         &'a self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &'a str,
         body: Option<&'a str>,
         signal: Option<&'a CancellationToken>,
@@ -1249,18 +1249,15 @@ impl Client {
             let token = self.ensure_token(signal.cloned()).await?;
             let url = self.compliance_url(path);
 
-            let mut headers: Vec<(reqwest::header::HeaderName, String)> = vec![
-                (reqwest::header::AUTHORIZATION, format!("Bearer {token}")),
-                (reqwest::header::ACCEPT, "application/json".to_string()),
+            let mut headers: Vec<(http::header::HeaderName, String)> = vec![
+                (http::header::AUTHORIZATION, format!("Bearer {token}")),
+                (http::header::ACCEPT, "application/json".to_string()),
             ];
             if body.is_some() {
-                headers.push((
-                    reqwest::header::CONTENT_TYPE,
-                    "application/json".to_string(),
-                ));
+                headers.push((http::header::CONTENT_TYPE, "application/json".to_string()));
             }
             for (k, v) in extra_headers {
-                if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
+                if let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) {
                     headers.push((name, v.clone()));
                 }
             }
@@ -1321,17 +1318,22 @@ impl Client {
         signal: Option<CancellationToken>,
     ) -> Result<T> {
         let ctl = self.derive_timeout_token(DEFAULT_JSON_TIMEOUT_MS, signal);
-        let token = self.ensure_token(ctl.clone()).await.ok();
+        let token_result = self.ensure_token(ctl.clone()).await;
+        let token = if self.uses_strict_authority() {
+            Some(token_result?)
+        } else {
+            token_result.ok()
+        };
         let url = self.compliance_url(path);
-        let mut headers: Vec<(reqwest::header::HeaderName, String)> =
-            vec![(reqwest::header::ACCEPT, "application/json".to_string())];
+        let mut headers: Vec<(http::header::HeaderName, String)> =
+            vec![(http::header::ACCEPT, "application/json".to_string())];
         if let Some(t) = token.filter(|t| !t.is_empty()) {
-            headers.push((reqwest::header::AUTHORIZATION, format!("Bearer {t}")));
+            headers.push((http::header::AUTHORIZATION, format!("Bearer {t}")));
         }
 
         let resp = self
             .do_request(
-                reqwest::Method::GET,
+                http::Method::GET,
                 &url,
                 &headers,
                 None,
@@ -1484,9 +1486,9 @@ fn urlencode(s: &str) -> String {
     crate::billing::entitlements::urlencoding(s)
 }
 
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> i64 {
+fn parse_retry_after(headers: &http::header::HeaderMap) -> i64 {
     headers
-        .get(reqwest::header::RETRY_AFTER)
+        .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|&s| s > 0)

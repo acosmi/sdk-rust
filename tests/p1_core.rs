@@ -1,9 +1,9 @@
 //! P1 地基行为等价性测试（shared + core）。
 
 use acosmi::core::{
-    classify_transport, default_retryable, default_safe_to_retry, is_order_success,
-    is_order_terminal, normalize_gateway_base_url, parse_http_error,
-    parse_http_error_with_retry_after, parse_stream_error, RetryRequestInfo,
+    default_retryable, default_safe_to_retry, is_order_success, is_order_terminal,
+    normalize_gateway_base_url, parse_http_error, parse_http_error_with_retry_after,
+    parse_stream_error, RetryRequestInfo,
 };
 use acosmi::shared::errors::{Error, HttpError, NetworkError};
 use acosmi::shared::retry_advice::{retry_reason_for_oauth_error, RetryAdviceReason};
@@ -92,6 +92,7 @@ fn retryable_excludes_stream_includes_5xx_429() {
 }
 
 #[test]
+#[cfg(feature = "native-http")]
 fn classify_transport_sets_network_error() {
     // 仅验证返回 NetworkError 且 op/url 透传（真实 reqwest::Error 需网络，故此处只校验形状由 http 错误路径覆盖）。
     let req_info = RetryRequestInfo {
@@ -99,7 +100,7 @@ fn classify_transport_sets_network_error() {
         url: "https://acosmi.com".into(),
     };
     assert!(default_safe_to_retry(&req_info));
-    let _ = classify_transport; // 引用以确保导出可用
+    let _ = acosmi::core::classify_transport; // 引用以确保导出可用
 }
 
 #[test]

@@ -57,21 +57,20 @@ pub mod support;
 // 逐域 re-export（对齐 index.ts 单一真源）。方法名 snake_case，类型名 PascalCase 保留跨语言锚点。
 pub use crate::auth::{
     all_scopes, chat_bridge_scopes, code_challenge, commerce_scopes,
-    complete_web_authorization_request, create_web_authorization_request, discover,
-    discover_web_oauth_metadata, discover_with_profile, exchange_code, exchange_code_with_expiry,
-    generate_code_verifier, generate_state, is_invalid_grant_error, is_ssl_error,
-    is_valid_token_set, model_scopes, new_token_set, refresh_token, register,
-    register_web_oauth_client, remote_control_scopes, resolve_success_redirect, revoke_token,
-    skill_scopes, token_set_is_expired, AuthorizeResult, ClientRegistration,
-    CreateWebAuthorizationRequestOptions, LoginEvent, LoginOptions, OAuthTokenEndpointError,
-    RegisterWebOAuthClientOptions, ServerMetadata, TokenResponse, TokenSet,
-    WebAuthorizationCallbackParams, WebAuthorizationPending, WebAuthorizationRequest,
+    create_web_authorization_request, generate_code_verifier, generate_state,
+    is_invalid_grant_error, is_ssl_error, is_valid_token_set, model_scopes, new_token_set,
+    remote_control_scopes, resolve_success_redirect, skill_scopes, token_set_is_expired,
+    AuthorizeResult, ClientRegistration, CreateWebAuthorizationRequestOptions, LoginEvent,
+    LoginOptions, OAuthTokenEndpointError, RegisterWebOAuthClientOptions, ServerMetadata,
+    TokenResponse, TokenSet, WebAuthorizationCallbackParams, WebAuthorizationPending,
+    WebAuthorizationRequest,
 };
 pub use crate::core::{
-    read_gateway_request_id, ChatOptions, ChatUsageEvent, Client, Config, FileTokenStore,
-    FilterStatus, GatewayRequestIDCallback, HttpBody, HttpClient, HttpContext, HttpPurpose,
-    HttpRequest, HttpResponse, HttpResponseMode, HttpTransport, InMemoryTokenStore, TokenStore,
-    TransportError, UpstreamActivityCallback, DEFAULT_GATEWAY_BASE_URL, GATEWAY_REQUEST_ID_HEADER,
+    read_gateway_request_id, AuthorityResult, AuthorityState, ChatOptions, ChatUsageEvent, Client,
+    Config, FileTokenStore, FilterStatus, GatewayRequestIDCallback, HttpBody, HttpClient,
+    HttpContext, HttpPurpose, HttpRequest, HttpResponse, HttpResponseMode, HttpTransport,
+    InMemoryTokenStore, StrictTokenAuthority, TokenAuthorityError, TokenStore, TransportError,
+    UpstreamActivityCallback, DEFAULT_GATEWAY_BASE_URL, GATEWAY_REQUEST_ID_HEADER,
 };
 // === models 域逐项 re-export（对齐 models/index.ts）===
 pub use crate::models::{
@@ -112,7 +111,7 @@ pub use crate::skills::{
 // === notifications 域逐项 re-export（对齐 notifications/index.ts）===
 pub use crate::notifications::{
     parse_notification_event, DeviceRegistration, Notification, NotificationList,
-    NotificationPreference, NotificationUnreadCount, WSConfig, WSEvent,
+    NotificationPreference, NotificationUnreadCount, WSEvent,
 };
 // === agent-runs 域逐项 re-export（对齐 agent-runs/index.ts）===
 pub use crate::agent_runs::{
@@ -198,12 +197,20 @@ pub use crate::auth::auth::{
 
 pub use crate::auth::auth::discover_with_transport;
 
+#[cfg(feature = "native-http")]
+pub use crate::auth::auth::{
+    complete_web_authorization_request, discover, discover_web_oauth_metadata,
+    discover_with_profile, exchange_code, exchange_code_with_expiry, refresh_token, register,
+    register_web_oauth_client, revoke_token,
+};
+#[cfg(feature = "notifications-ws")]
+pub use crate::notifications::WSConfig;
 #[cfg(test)]
 mod scaffold_tests {
     use super::*;
 
     #[test]
     fn version_is_wired() {
-        assert_eq!(VERSION, "3.0.0");
+        assert_eq!(VERSION, "4.0.0");
     }
 }

@@ -1,3 +1,4 @@
+#![cfg(feature = "native-http")]
 //! P2 auth 行为测试：refresh 轮换（换新撤旧）+ 单航班 + syncFromDisk 采纳磁盘新版。
 //!
 //! 用一个最小内嵌 HTTP mock（std TcpListener，单线程逐请求应答）模拟 OAuth

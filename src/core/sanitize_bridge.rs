@@ -104,7 +104,18 @@ mod tests {
     use serde_json::json;
 
     fn client() -> Client {
-        Client::new(Config::default()).unwrap()
+        struct NoNetwork;
+        #[async_trait::async_trait]
+        impl crate::HttpTransport for NoNetwork {
+            async fn execute(
+                &self,
+                _: crate::HttpRequest,
+                _: tokio_util::sync::CancellationToken,
+            ) -> std::result::Result<crate::HttpResponse, crate::TransportError> {
+                Err(crate::TransportError::Rejected)
+            }
+        }
+        Client::new_with_transport(Config::default(), std::sync::Arc::new(NoNetwork)).unwrap()
     }
 
     // ── 验收 apply_request_sanitizers 接通：未配置零开销 early-return ───────────────

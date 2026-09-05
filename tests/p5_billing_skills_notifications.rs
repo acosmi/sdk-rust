@@ -1,3 +1,4 @@
+#![cfg(feature = "native-http")]
 //! P5a 行为等价性测试：billing 金额三阵营端到端、skills 下载 50MB 上限、
 //! notifications WebSocket 一次性 stream-ticket 取号。
 //!

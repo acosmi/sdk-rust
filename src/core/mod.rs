@@ -16,10 +16,9 @@ pub use client::{
     DEFAULT_GATEWAY_BASE_URL, ERR_OAUTH_CORS_BLOCKED, ERR_REFRESH_PROXY_FAILED, ERR_TOKEN_EXPIRED,
 };
 pub use http::{
-    classify_transport, is_order_success, is_order_terminal, iter_sse_lines, parse_http_error,
-    parse_http_error_with_retry_after, parse_stream_error, read_limited, read_limited_text,
-    CHAT_REQUEST_TIMEOUT_MS, COEF_CACHE_TTL_MS, DEFAULT_JSON_TIMEOUT_MS, MAX_DOWNLOAD_SIZE,
-    MAX_ERROR_BODY_SIZE, MAX_SSE_LINE_SIZE, MODEL_CACHE_TTL_MS,
+    is_order_success, is_order_terminal, parse_http_error, parse_http_error_with_retry_after,
+    parse_stream_error, CHAT_REQUEST_TIMEOUT_MS, COEF_CACHE_TTL_MS, DEFAULT_JSON_TIMEOUT_MS,
+    MAX_DOWNLOAD_SIZE, MAX_ERROR_BODY_SIZE, MAX_SSE_LINE_SIZE, MODEL_CACHE_TTL_MS,
 };
 pub use retry::{
     compute_backoff, default_retryable, default_safe_to_retry, effective_policy,
@@ -41,3 +40,13 @@ pub use transport::{
     HttpBody, HttpClient, HttpContext, HttpPurpose, HttpRequest, HttpResponse, HttpResponseMode,
     HttpTransport, TransportError,
 };
+
+#[cfg(feature = "native-http")]
+pub use http::{classify_transport, iter_sse_lines, read_limited, read_limited_text};
+pub use http::{
+    iter_sse_lines_result, iter_sse_lines_result_with_cap, read_limited_result,
+    read_limited_text_result,
+};
+
+pub mod authority;
+pub use authority::{AuthorityResult, AuthorityState, StrictTokenAuthority, TokenAuthorityError};

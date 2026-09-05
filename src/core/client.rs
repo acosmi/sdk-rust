@@ -11,6 +11,9 @@
 
 use crate::auth::auth as oauth;
 use crate::auth::types::{token_set_is_expired, ServerMetadata, TokenSet};
+use crate::core::authority::{
+    tokens_equal, AuthorityState, StrictState, StrictTokenAuthority, TokenAuthorityError,
+};
 use crate::core::http::{
     iter_sse_lines_result as iter_sse_lines, parse_http_error_with_retry_after, parse_stream_error,
     read_limited_text_result as read_limited_text, CHAT_REQUEST_TIMEOUT_MS,
@@ -104,6 +107,7 @@ pub struct Config {
     /// 自定义 TokenStore；缺省按平台选（原生 = File）。
     pub store: Option<Arc<dyn TokenStore>>,
     /// 自定义 HTTP client（对应 TS `fetchImpl`）。
+    #[cfg(feature = "native-http")]
     pub http: Option<reqwest::Client>,
     /// 重试策略；`None` = 禁用重试（与 TS 默认一致）。
     pub retry_policy: Option<RetryPolicy>,
@@ -131,6 +135,7 @@ pub(crate) struct ClientInner {
     /// 共享 HTTP client。
     http: HttpClient,
     store: Arc<dyn TokenStore>,
+    strict: Option<StrictState>,
     /// 生效重试策略。
     retry_policy: Option<EffectiveRetryPolicy>,
 
@@ -153,6 +158,7 @@ pub(crate) struct ClientInner {
     coef_cache: RwLock<Option<(Vec<crate::billing::ModelCoefficient>, std::time::Instant)>>,
     /// 当前 WebSocket 长连接状态句柄（对应 TS `this.ws`）。`None` = 未连接。
     /// 重复 connect 前先 disconnect 旧连接（防 ws-reconnect-leak）。
+    #[cfg(feature = "notifications-ws")]
     ws: tokio::sync::Mutex<Option<crate::notifications::WsHandle>>,
     /// P8 sanitize-bridge：请求前底线防御配置（体积 / deny-list / 深度）。`None` = 未配置
     /// （对齐 TS `defensiveCfg == null`）。并发安全 sync 读写（不跨 await）。
@@ -178,21 +184,24 @@ impl Client {
     /// ```
     /// use acosmi::{Client, Config};
     ///
+    /// # #[cfg(feature = "native-http")]
+    /// # {
     /// let client = Client::new(Config {
     ///     server_url: Some("https://acosmi.com".into()),
     ///     ..Default::default()
     /// })
     /// .unwrap();
     /// assert_eq!(client.base_url(), "https://acosmi.com");
+    /// # }
     /// ```
     pub fn new(cfg: Config) -> Result<Self> {
-        Self::new_inner(cfg, None)
+        Self::new_inner(cfg, None, None)
     }
 
     /// Construct with an exclusive custom HTTP transport. `Config.http` is ignored.
     /// Inject a TokenStore separately when caller-owned persistence is required.
     pub fn new_with_transport(cfg: Config, transport: Arc<dyn HttpTransport>) -> Result<Self> {
-        Self::new_inner(cfg, Some(transport))
+        Self::new_inner(cfg, Some(transport), None)
     }
 
     /// Construct with custom transport and load the configured token store.
@@ -205,7 +214,24 @@ impl Client {
         Ok(client)
     }
 
-    fn new_inner(cfg: Config, transport: Option<Arc<dyn HttpTransport>>) -> Result<Self> {
+    /// Create a client with caller-owned durable token authority. Config.store is
+    /// ignored. Missing is an unauthenticated client; load errors and Pending fail.
+    pub async fn create_with_authority(
+        cfg: Config,
+        transport: Arc<dyn HttpTransport>,
+        authority: Arc<dyn StrictTokenAuthority>,
+        signal: Option<CancellationToken>,
+    ) -> Result<Self> {
+        let client = Self::new_inner(cfg, Some(transport), Some(authority))?;
+        client.reconcile_authority(signal).await?;
+        Ok(client)
+    }
+
+    fn new_inner(
+        cfg: Config,
+        transport: Option<Arc<dyn HttpTransport>>,
+        authority: Option<Arc<dyn StrictTokenAuthority>>,
+    ) -> Result<Self> {
         let server_url = match &cfg.server_url {
             Some(s) => normalize_gateway_base_url(s)?,
             None => DEFAULT_GATEWAY_BASE_URL.to_string(),
@@ -222,22 +248,33 @@ impl Client {
         let http = if let Some(transport) = transport {
             HttpClient::new(transport)
         } else {
-            HttpClient::legacy(match cfg.http {
-                Some(c) => c,
-                None => reqwest::Client::builder()
-                    // 🔴 绝不设 client 级 `.timeout(...)`：reqwest 的 timeout 覆盖整个响应体（含 SSE 流）
-                    // 的总死线，会 abort >60s 的流式 SSE，也会抢先砍掉 11min 非流式 chat 的 per-request
-                    // 死线（TS 用 fetch 无 client 级总超时）。死线一律靠 per-request `derive_timeout_token`
-                    // （非流式）/ 调用方 signal（流式保长连接）派生。这里仅兜底连接握手。
-                    .connect_timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .map_err(Error::from)?,
-            })
+            #[cfg(feature = "native-http")]
+            {
+                HttpClient::legacy(match cfg.http {
+                    Some(c) => c,
+                    None => reqwest::Client::builder()
+                        // 🔴 绝不设 client 级 `.timeout(...)`：reqwest 的 timeout 覆盖整个响应体（含 SSE 流）
+                        // 的总死线，会 abort >60s 的流式 SSE，也会抢先砍掉 11min 非流式 chat 的 per-request
+                        // 死线（TS 用 fetch 无 client 级总超时）。死线一律靠 per-request `derive_timeout_token`
+                        // （非流式）/ 调用方 signal（流式保长连接）派生。这里仅兜底连接握手。
+                        .connect_timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .map_err(Error::from)?,
+                })
+            }
+            #[cfg(not(feature = "native-http"))]
+            {
+                return Err(Error::other("native HTTP disabled: inject HttpTransport"));
+            }
         };
 
-        let store: Arc<dyn TokenStore> = match cfg.store {
-            Some(s) => s,
-            None => default_store(),
+        let store: Arc<dyn TokenStore> = if authority.is_some() {
+            Arc::new(InMemoryTokenStore::new())
+        } else {
+            match cfg.store {
+                Some(s) => s,
+                None => default_store(),
+            }
         };
 
         let retry_policy = effective_policy(cfg.retry_policy.as_ref());
@@ -252,6 +289,7 @@ impl Client {
                 refresh_proxy_url: cfg.refresh_proxy_url,
                 http,
                 store,
+                strict: authority.map(StrictState::new),
                 retry_policy,
                 tokens: RwLock::new(None),
                 model_cache: RwLock::new(Vec::new()),
@@ -261,6 +299,7 @@ impl Client {
                 mu: tokio::sync::Mutex::new(()),
                 token_ready: tokio::sync::Notify::new(),
                 coef_cache: RwLock::new(None),
+                #[cfg(feature = "notifications-ws")]
                 ws: tokio::sync::Mutex::new(None),
                 #[cfg(feature = "sanitize")]
                 defensive_cfg: RwLock::new(None),
@@ -289,6 +328,14 @@ impl Client {
 
     /// 是否已持有 token（同步）。
     pub fn is_authorized(&self) -> bool {
+        if self
+            .inner
+            .strict
+            .as_ref()
+            .is_some_and(|s| s.check().is_err())
+        {
+            return false;
+        }
         self.inner.tokens.read().unwrap().is_some()
     }
 
@@ -304,6 +351,14 @@ impl Client {
 
     /// 当前 token 快照（克隆）。
     pub fn token_set(&self) -> Option<TokenSet> {
+        if self
+            .inner
+            .strict
+            .as_ref()
+            .is_some_and(|s| s.check().is_err())
+        {
+            return None;
+        }
         self.inner
             .tokens
             .read()
@@ -350,11 +405,16 @@ impl Client {
     }
 
     /// 当前 WebSocket 状态槽（notifications/ws 业务方法用）。
+    #[cfg(feature = "notifications-ws")]
     pub(crate) fn ws_slot(&self) -> &tokio::sync::Mutex<Option<crate::notifications::WsHandle>> {
         &self.inner.ws
     }
 
     /// 生效重试策略（`None` = 禁用）。
+    pub(crate) fn uses_strict_authority(&self) -> bool {
+        self.inner.strict.is_some()
+    }
+
     pub(crate) fn retry_policy(&self) -> Option<&EffectiveRetryPolicy> {
         self.inner.retry_policy.as_ref()
     }
@@ -397,6 +457,18 @@ impl Client {
         opts: &oauth::LoginOptions,
         signal: Option<CancellationToken>,
     ) -> Result<()> {
+        let strict = self.inner.strict.as_ref();
+        let _authority_guards = if let Some(strict) = strict {
+            strict.check()?;
+            let mutex = with_cancel(signal.as_ref(), self.inner.mu.lock()).await?;
+            strict.check()?;
+            let guard = with_cancel(signal.as_ref(), strict.authority.lock()).await??;
+            let state = with_cancel(signal.as_ref(), self.read_authority(strict)).await??;
+            self.cache_authority_state(state);
+            Some((mutex, guard))
+        } else {
+            None
+        };
         let emit = |e: oauth::LoginEvent| {
             if let Some(h) = handler {
                 h(e);
@@ -509,6 +581,9 @@ impl Client {
             }
         };
 
+        if let Some(strict) = &self.inner.strict {
+            self.begin_authority_rotation(strict).await?;
+        }
         // 4. 换 token（支持自定义 expires_in）
         let token_resp = {
             let exchange = if let Some(exp) = opts.expires_in.filter(|&e| e > 0) {
@@ -554,13 +629,16 @@ impl Client {
             &client_id,
             &self.inner.server_url,
         ));
-        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*tokens).clone()));
-        self.inner.token_ready.notify_waiters();
-        if self.inner.store.save(&tokens).await.is_err() {
-            return Err(Error::other("save tokens failed"));
+        if let Some(strict) = &self.inner.strict {
+            self.commit_authority_rotation(strict, &tokens).await?;
+        } else {
+            *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*tokens).clone()));
+            self.inner.token_ready.notify_waiters();
+            if self.inner.store.save(&tokens).await.is_err() {
+                return Err(Error::other("save tokens failed"));
+            }
         }
 
-        // 6. 完成
         emit(oauth::LoginEvent::complete());
         Ok(())
     }
@@ -595,6 +673,9 @@ impl Client {
 
     /// 吊销 token 并清除本地存储。对应 TS `logout`。
     pub async fn logout(&self, signal: Option<CancellationToken>) -> Result<()> {
+        if self.inner.strict.is_some() {
+            return with_cancel(signal.as_ref(), self.logout_authority(signal.clone())).await?;
+        }
         let tokens = self.inner.tokens.write().unwrap().take();
         let mut meta = self.inner.meta.write().unwrap().take();
         // 重置等待信号：下次 login 重新触发等待→唤醒流程。
@@ -642,10 +723,21 @@ impl Client {
     ///   - 过期 → 双层串行：`mu`（进程内单航班）+ `store.lock`（跨进程临界区）；进入临界区后
     ///     先 `store.load()` 重读磁盘（多进程 rotation 防 400），双检过期决定是否真刷新。
     pub async fn ensure_token(&self, signal: Option<CancellationToken>) -> Result<String> {
-        with_cancel(signal.as_ref(), self.ensure_token_internal(signal.clone())).await?
+        {
+            let result = with_cancel(signal.as_ref(), self.ensure_token_internal(signal.clone()))
+                .await
+                .and_then(|r| r);
+            if result.is_err() && self.inner.strict.is_some() {
+                self.clear_authority_cache();
+            }
+            result
+        }
     }
 
     async fn ensure_token_internal(&self, signal: Option<CancellationToken>) -> Result<String> {
+        if self.inner.strict.is_some() {
+            return self.ensure_authority_token(false, signal).await;
+        }
         let mut tokens = self.token_set();
 
         if tokens.is_none() {
@@ -717,10 +809,20 @@ impl Client {
     /// 同 [`Self::ensure_token`] 的刷新路径：mu + store.lock + syncFromDisk。别的进程刚 rotation
     /// 过的话磁盘上是新 RT，本进程用磁盘新 RT 即可成功；否则用旧 RT 必撞 "refresh token not found" 400。
     pub async fn force_refresh(&self, signal: Option<CancellationToken>) -> Result<()> {
-        with_cancel(signal.as_ref(), self.force_refresh_internal(signal.clone())).await?
+        let result = with_cancel(signal.as_ref(), self.force_refresh_internal(signal.clone()))
+            .await
+            .and_then(|r| r);
+        if result.is_err() && self.uses_strict_authority() {
+            self.clear_authority_cache();
+        }
+        result
     }
 
     async fn force_refresh_internal(&self, signal: Option<CancellationToken>) -> Result<()> {
+        if self.inner.strict.is_some() {
+            self.ensure_authority_token(true, signal).await?;
+            return Ok(());
+        }
         let _g = self.inner.mu.lock().await;
         let _lock = self
             .inner
@@ -733,6 +835,168 @@ impl Client {
             return Err(Error::other("no tokens to refresh"));
         }
         self.refresh_current_token(signal).await
+    }
+
+    async fn read_authority(&self, strict: &StrictState) -> Result<AuthorityState> {
+        let state = match strict.authority.load().await {
+            Ok(state) => state,
+            Err(error) => {
+                self.clear_authority_cache();
+                return Err(error.into());
+            }
+        };
+        if matches!(state, AuthorityState::RotationPending) {
+            strict.block();
+            self.clear_authority_cache();
+            return Err(TokenAuthorityError::RotationPending.into());
+        }
+        Ok(state)
+    }
+
+    fn clear_authority_cache(&self) {
+        *self.inner.tokens.write().unwrap() = None;
+    }
+    fn cache_authority_state(&self, state: AuthorityState) -> bool {
+        match state {
+            AuthorityState::Ready(tokens) => {
+                *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(tokens));
+                true
+            }
+            AuthorityState::Missing | AuthorityState::RotationPending => {
+                self.clear_authority_cache();
+                false
+            }
+        }
+    }
+
+    /// Pure authority read, never refreshes or resolves durable Pending. The host
+    /// must first resolve uncertain transactions and actor/revision fencing.
+    /// Calling this explicitly accepts that host reconciliation has completed.
+    pub async fn reconcile_authority(&self, signal: Option<CancellationToken>) -> Result<bool> {
+        self.clear_authority_cache();
+        let strict = self
+            .inner
+            .strict
+            .as_ref()
+            .ok_or_else(|| Error::other("strict token authority not configured"))?;
+        with_cancel(signal.as_ref(), async {
+            let _mutex = self.inner.mu.lock().await;
+            let _guard = strict.authority.lock().await?;
+            let state = self.read_authority(strict).await?;
+            let ready = self.cache_authority_state(state);
+            strict.reconcile();
+            Ok(ready)
+        })
+        .await?
+    }
+
+    async fn begin_authority_rotation(&self, strict: &StrictState) -> Result<()> {
+        // Set before awaiting: cancellation or an ambiguous begin may already have committed.
+        strict.block();
+        self.clear_authority_cache();
+        strict.authority.begin_rotation().await?;
+        Ok(())
+    }
+
+    async fn commit_authority_rotation(
+        &self,
+        strict: &StrictState,
+        tokens: &TokenSet,
+    ) -> Result<()> {
+        strict.authority.commit_rotation(tokens).await?;
+        // Do not expose either a mismatching or unconfirmed readback.
+        let state = strict.authority.load().await?;
+        match state {
+            AuthorityState::Ready(confirmed) => {
+                let confirmed = zeroize::Zeroizing::new(confirmed);
+                if !tokens_equal(&confirmed, tokens) {
+                    return Err(TokenAuthorityError::CommitUnverified.into());
+                }
+                *self.inner.tokens.write().unwrap() =
+                    Some(zeroize::Zeroizing::new((*confirmed).clone()));
+                strict.reconcile();
+                self.inner.token_ready.notify_waiters();
+                Ok(())
+            }
+            _ => Err(TokenAuthorityError::CommitUnverified.into()),
+        }
+    }
+
+    async fn ensure_authority_token(
+        &self,
+        force: bool,
+        signal: Option<CancellationToken>,
+    ) -> Result<String> {
+        let strict = self
+            .inner
+            .strict
+            .as_ref()
+            .ok_or(TokenAuthorityError::Unavailable)?;
+        strict.check()?;
+        let _mutex = self.inner.mu.lock().await;
+        strict.check()?;
+        let _guard = strict.authority.lock().await?;
+        let state = self.read_authority(strict).await?;
+        let tokens = match state {
+            AuthorityState::Ready(tokens) => zeroize::Zeroizing::new(tokens),
+            _ => {
+                self.clear_authority_cache();
+                return Err(TokenAuthorityError::Missing.into());
+            }
+        };
+        if !force && !token_set_is_expired(&tokens) {
+            *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*tokens).clone()));
+            return Ok(tokens.access_token.clone());
+        }
+        if self.inner.browser_refresh_mode == BrowserRefreshMode::None {
+            self.clear_authority_cache();
+            return Err(Error::other("token refresh disabled"));
+        }
+        self.begin_authority_rotation(strict).await?;
+        let new_set = zeroize::Zeroizing::new(match self.inner.browser_refresh_mode {
+            BrowserRefreshMode::ServerProxy => {
+                self.fetch_refresh_via_proxy(&tokens, signal).await?
+            }
+            BrowserRefreshMode::Direct => self.fetch_refresh_direct(&tokens, signal).await?,
+            BrowserRefreshMode::None => return Err(Error::other("token refresh disabled")),
+        });
+        self.commit_authority_rotation(strict, &new_set).await?;
+        Ok(new_set.access_token.clone())
+    }
+
+    async fn logout_authority(&self, signal: Option<CancellationToken>) -> Result<()> {
+        let strict = self
+            .inner
+            .strict
+            .as_ref()
+            .ok_or(TokenAuthorityError::Unavailable)?;
+        strict.check()?;
+        let _mutex = self.inner.mu.lock().await;
+        strict.check()?;
+        let _guard = strict.authority.lock().await?;
+        let state = self.read_authority(strict).await?;
+        let tokens = match state {
+            AuthorityState::Ready(t) => Some(zeroize::Zeroizing::new(t)),
+            _ => None,
+        };
+        strict.block();
+        self.clear_authority_cache();
+        strict.authority.clear().await?;
+        if !matches!(strict.authority.load().await?, AuthorityState::Missing) {
+            return Err(TokenAuthorityError::CommitUnverified.into());
+        }
+        strict.reconcile();
+        self.inner.login_in_flight.store(false, Ordering::SeqCst);
+        if let Some(tokens) = tokens {
+            if let Ok(meta) = self.discover_for_lifecycle(signal.clone()).await {
+                let http = self.http().with_cancellation(signal);
+                let _ =
+                    oauth::revoke_token_with_transport(&http, &meta, &tokens.access_token).await;
+                let _ =
+                    oauth::revoke_token_with_transport(&http, &meta, &tokens.refresh_token).await;
+            }
+        }
+        Ok(())
     }
 
     // ── 私有 helper ──
@@ -773,17 +1037,31 @@ impl Client {
             BrowserRefreshMode::None => Err(Error::other(format!(
                 "{ERR_TOKEN_EXPIRED}: token refresh disabled"
             ))),
-            BrowserRefreshMode::ServerProxy => self.refresh_via_proxy(signal).await,
-            BrowserRefreshMode::Direct => self.refresh_direct(signal).await,
+            BrowserRefreshMode::ServerProxy => self.refresh_legacy(true, signal).await,
+            BrowserRefreshMode::Direct => self.refresh_legacy(false, signal).await,
         }
     }
 
-    async fn refresh_direct(&self, signal: Option<CancellationToken>) -> Result<()> {
+    async fn refresh_legacy(&self, proxy: bool, signal: Option<CancellationToken>) -> Result<()> {
         let cur = zeroize::Zeroizing::new(
             self.token_set()
                 .ok_or_else(|| Error::other("no tokens to refresh"))?,
         );
+        let new_set = zeroize::Zeroizing::new(if proxy {
+            self.fetch_refresh_via_proxy(&cur, signal).await?
+        } else {
+            self.fetch_refresh_direct(&cur, signal).await?
+        });
+        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*new_set).clone()));
+        self.save_refreshed_token(&new_set).await;
+        Ok(())
+    }
 
+    async fn fetch_refresh_direct(
+        &self,
+        cur: &TokenSet,
+        signal: Option<CancellationToken>,
+    ) -> Result<TokenSet> {
         // 确保 meta（与签发同 profile）。
         if self.inner.meta.read().unwrap().is_none() {
             match self.discover_for_lifecycle(signal.clone()).await {
@@ -810,10 +1088,10 @@ impl Client {
             Ok(r) => r,
             Err(e) => {
                 if oauth::is_invalid_grant_error(&e) {
-                    self.clear_invalid_refresh_token().await;
-                    return Err(Error::other(format!(
-                        "refresh token invalid; local tokens cleared: {e}"
-                    )));
+                    if self.inner.strict.is_none() {
+                        self.clear_invalid_refresh_token().await;
+                    }
+                    return Err(Error::other(format!("refresh token invalid: {e}")));
                 }
                 let msg = e.to_string();
                 if is_likely_browser_oauth_cors_error(&msg) {
@@ -831,16 +1109,14 @@ impl Client {
             &cur.client_id,
             &self.inner.server_url,
         ));
-        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new((*new_set).clone()));
-        self.save_refreshed_token(&new_set).await;
-        Ok(())
+        Ok((*new_set).clone())
     }
 
-    async fn refresh_via_proxy(&self, signal: Option<CancellationToken>) -> Result<()> {
-        let cur = zeroize::Zeroizing::new(
-            self.token_set()
-                .ok_or_else(|| Error::other("no tokens to refresh"))?,
-        );
+    async fn fetch_refresh_via_proxy(
+        &self,
+        cur: &TokenSet,
+        signal: Option<CancellationToken>,
+    ) -> Result<TokenSet> {
         let proxy_url = self.inner.refresh_proxy_url.as_deref().ok_or_else(|| {
             Error::other(format!(
                 "{ERR_REFRESH_PROXY_FAILED}: refreshProxyURL is required"
@@ -888,9 +1164,11 @@ impl Client {
                         .map(str::to_owned)
                 });
             if oauth_error.as_deref() == Some("invalid_grant") {
-                self.clear_invalid_refresh_token().await;
+                if self.inner.strict.is_none() {
+                    self.clear_invalid_refresh_token().await;
+                }
                 return Err(Error::other(format!(
-                    "{ERR_REFRESH_PROXY_FAILED}: refresh token invalid; local tokens cleared"
+                    "{ERR_REFRESH_PROXY_FAILED}: refresh token invalid"
                 )));
             }
             return Err(Error::other(format!(
@@ -914,9 +1192,7 @@ impl Client {
             ))
         })?;
 
-        *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(new_set.clone()));
-        self.save_refreshed_token(&new_set).await;
-        Ok(())
+        Ok(new_set)
     }
 
     async fn save_refreshed_token(&self, tokens: &TokenSet) {
@@ -989,7 +1265,7 @@ impl Client {
         &self,
         path: &str,
         signal: Option<CancellationToken>,
-    ) -> Result<(T, reqwest::header::HeaderMap)> {
+    ) -> Result<(T, http::header::HeaderMap)> {
         self.do_json_get_internal(path, signal, false).await
     }
 
@@ -1043,7 +1319,7 @@ impl Client {
         path: &str,
         signal: Option<CancellationToken>,
         retried: bool,
-    ) -> Result<(T, reqwest::header::HeaderMap)> {
+    ) -> Result<(T, http::header::HeaderMap)> {
         // per-request 死线（对齐 TS doJSONGet 30s）：去掉 client 级总超时后，GET 必须自派生 30s
         // 子 token，否则变无超时。401 重试沿用原 `signal` 各自重新派生（见下方递归调用）。
         let req_signal = self.derive_timeout_token(DEFAULT_JSON_TIMEOUT_MS, signal.clone());
@@ -1055,7 +1331,7 @@ impl Client {
             .get(&url)
             .cancel(req_signal.clone())
             .header(
-                reqwest::header::AUTHORIZATION,
+                http::header::AUTHORIZATION,
                 format!("Bearer {}", token.as_str()),
             )
             .send();
@@ -1083,7 +1359,7 @@ impl Client {
         if !status.is_success() {
             let retry_after = resp
                 .headers()
-                .get(reqwest::header::RETRY_AFTER)
+                .get(http::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .filter(|&s| s > 0)
@@ -1262,24 +1538,44 @@ impl Client {
 
     /// 单次 HTTP 请求（**无重试**）。对应 TS `doRequest`。
     ///
-    /// 传输层错误经 [`crate::core::http::classify_transport`] 转 [`Error::Network`]（便于 retry policy 判定）。
+    /// 传输层错误经 `classify_transport` 转 [`Error::Network`]（便于 retry policy 判定）。
     /// 取消信号经 `select!` 接入。**流式路径必须直接走此函数**，绝不经 [`Self::do_request_with_retry`]。
     pub(crate) async fn do_request(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         url: &str,
-        headers: &[(reqwest::header::HeaderName, String)],
+        headers: &[(http::header::HeaderName, String)],
         body: Option<&str>,
         signal: Option<&CancellationToken>,
         context: HttpContext,
     ) -> Result<crate::core::transport::Response> {
+        // A retry is another protected request: re-read authority before dispatch.
+        let authority_token = if self.uses_strict_authority()
+            && headers
+                .iter()
+                .any(|(name, _)| name == http::header::AUTHORIZATION)
+        {
+            Some(zeroize::Zeroizing::new(
+                self.ensure_token(signal.cloned()).await?,
+            ))
+        } else {
+            None
+        };
         let mut rb = self
             .http()
             .request(method.clone(), url)
             .context(context)
             .cancel(signal.cloned());
         for (k, v) in headers {
-            rb = rb.header(k.clone(), v.clone());
+            rb = if k == http::header::AUTHORIZATION {
+                if let Some(token) = &authority_token {
+                    rb.header(k.clone(), format!("Bearer {}", token.as_str()))
+                } else {
+                    rb.header(k.clone(), v.clone())
+                }
+            } else {
+                rb.header(k.clone(), v.clone())
+            };
         }
         if let Some(b) = body {
             rb = rb.body(b.to_string());
@@ -1297,9 +1593,9 @@ impl Client {
     /// 必须直接用 [`Self::do_request`]（重试 = 双 token + 重复消息 = 双扣，计费安全红线）。
     async fn do_request_with_retry(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         url: &str,
-        headers: &[(reqwest::header::HeaderName, String)],
+        headers: &[(http::header::HeaderName, String)],
         body: Option<&str>,
         signal: Option<&CancellationToken>,
         context: HttpContext,
@@ -1368,13 +1664,13 @@ impl Client {
     /// 读 body bytes。
     pub(crate) async fn do_json_full_raw(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<CancellationToken>,
         timeout_ms: u64,
         options: Option<ChatOptions>,
-    ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
+    ) -> Result<(Vec<u8>, http::header::HeaderMap)> {
         // per-request 超时（对应 TS withRequestTimeout）：派生子 token，超时或 parent 取消任一触发即 abort。
         let ctl = self.derive_timeout_token(timeout_ms, signal);
         self.do_json_full_raw_internal(
@@ -1390,27 +1686,24 @@ impl Client {
 
     async fn do_json_full_raw_internal(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<&CancellationToken>,
         timeout_ms: u64,
         mut options: ChatOptions,
-    ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
+    ) -> Result<(Vec<u8>, http::header::HeaderMap)> {
         let mut retried = false;
         loop {
             let token = zeroize::Zeroizing::new(self.ensure_token(signal.cloned()).await?);
             let url = self.api_url(path);
 
-            let mut headers: Vec<(reqwest::header::HeaderName, String)> = vec![(
-                reqwest::header::AUTHORIZATION,
+            let mut headers: Vec<(http::header::HeaderName, String)> = vec![(
+                http::header::AUTHORIZATION,
                 format!("Bearer {}", token.as_str()),
             )];
             if body.is_some() {
-                headers.push((
-                    reqwest::header::CONTENT_TYPE,
-                    "application/json".to_string(),
-                ));
+                headers.push((http::header::CONTENT_TYPE, "application/json".to_string()));
             }
 
             let resp = self
@@ -1469,11 +1762,11 @@ impl Client {
     /// 这里返回 `Option<T>`，让调用方对空体显式处理（与 GET-only `do_json_get_full` 的强 Err 互补）。
     pub(crate) async fn do_json_full<T: DeserializeOwned>(
         &self,
-        method: reqwest::Method,
+        method: http::Method,
         path: &str,
         body: Option<&str>,
         signal: Option<CancellationToken>,
-    ) -> Result<(Option<T>, reqwest::header::HeaderMap)> {
+    ) -> Result<(Option<T>, http::header::HeaderMap)> {
         let (bytes, headers) = self
             .do_json_full_raw(method, path, body, signal, DEFAULT_JSON_TIMEOUT_MS, None)
             .await?;
@@ -1576,7 +1869,7 @@ impl Client {
         );
         let (bytes, headers) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&body),
                 signal,
@@ -1622,7 +1915,7 @@ impl Client {
             .map_err(|e| Error::other(format!("serialize embedding request: {e}")))?;
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&body),
                 signal,
@@ -1649,7 +1942,7 @@ impl Client {
             .map_err(|e| Error::other(format!("serialize rerank request: {e}")))?;
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&body),
                 signal,
@@ -1690,7 +1983,7 @@ impl Client {
             .map_err(|e| Error::other(format!("serialize image request: {e}")))?;
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&body),
                 signal,
@@ -1722,7 +2015,7 @@ impl Client {
             .map_err(|e| Error::other(format!("serialize video request: {e}")))?;
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&body),
                 signal,
@@ -1753,7 +2046,7 @@ impl Client {
         }
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::GET,
+                http::Method::GET,
                 &endpoint,
                 None,
                 signal,
@@ -1821,7 +2114,7 @@ impl Client {
         let endpoint = format!("/managed-models/{}/anthropic", urlencode(model_id));
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&data),
                 signal,
@@ -1875,7 +2168,7 @@ impl Client {
         );
         let (bytes, _) = self
             .do_json_full_raw(
-                reqwest::Method::POST,
+                http::Method::POST,
                 &endpoint,
                 Some(&data),
                 signal,
@@ -2038,7 +2331,7 @@ impl Client {
 
             // 🔴 红线：流式只走 do_request（单次），绝不 do_request_with_retry。
             let resp = self
-                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref(), HttpContext::streaming(HttpPurpose::Model, CHAT_REQUEST_TIMEOUT_MS))
+                .do_request(http::Method::POST, &url, &headers, Some(&body), signal.as_ref(), HttpContext::streaming(HttpPurpose::Model, CHAT_REQUEST_TIMEOUT_MS))
                 .await?;
 
             // 401 单次重试：force_refresh 后递归一次（retried guard 防递归）。
@@ -2146,7 +2439,7 @@ impl Client {
 
             // 🔴 红线：流式只走 do_request（单次），绝不重试。
             let resp = self
-                .do_request(reqwest::Method::POST, &url, &headers, Some(&body), signal.as_ref(), HttpContext::streaming(HttpPurpose::Model, CHAT_REQUEST_TIMEOUT_MS))
+                .do_request(http::Method::POST, &url, &headers, Some(&body), signal.as_ref(), HttpContext::streaming(HttpPurpose::Model, CHAT_REQUEST_TIMEOUT_MS))
                 .await?;
 
             if resp.status().as_u16() == 401 && !retried {
@@ -2268,19 +2561,19 @@ impl Client {
     // ── 测试辅助（仅 cfg(test)）──
 
     /// 直接注入未过期 token（测试用，绕过 OAuth 登录流）。对应 TS `primeTokensForTest`。
-    #[cfg(test)]
+    #[cfg(all(test, feature = "native-http"))]
     fn prime_tokens_for_test(&self, tokens: TokenSet) {
         *self.inner.tokens.write().unwrap() = Some(zeroize::Zeroizing::new(tokens));
     }
 
     /// 直接注入 OAuth server 元数据（测试用，绕过 discover）。
-    #[cfg(test)]
+    #[cfg(all(test, feature = "native-http"))]
     fn prime_meta_for_test(&self, meta: ServerMetadata) {
         *self.inner.meta.write().unwrap() = Some(meta);
     }
 
     /// 把占位 ManagedModel 塞入缓存（测试用）。对应 TS `primeModelCacheForTest`。
-    #[cfg(test)]
+    #[cfg(all(test, feature = "native-http"))]
     fn prime_model_cache_for_test(&self, models: Vec<ManagedModel>) {
         *self.inner.model_cache.write().unwrap() = models;
         *self.inner.model_cache_time.write().unwrap() = Some(std::time::Instant::now());
@@ -2299,21 +2592,18 @@ pub enum ChatUsageEvent {
 }
 
 /// 流式请求公共头（Bearer + JSON + SSE Accept）。
-fn stream_headers(token: &str) -> Vec<(reqwest::header::HeaderName, String)> {
+fn stream_headers(token: &str) -> Vec<(http::header::HeaderName, String)> {
     vec![
-        (reqwest::header::AUTHORIZATION, format!("Bearer {token}")),
-        (
-            reqwest::header::CONTENT_TYPE,
-            "application/json".to_string(),
-        ),
-        (reqwest::header::ACCEPT, "text/event-stream".to_string()),
+        (http::header::AUTHORIZATION, format!("Bearer {token}")),
+        (http::header::CONTENT_TYPE, "application/json".to_string()),
+        (http::header::ACCEPT, "text/event-stream".to_string()),
     ]
 }
 
 /// 从响应头解析 `Retry-After` 秒数（0 = 无 / 解析失败）。
-fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> i64 {
+fn parse_retry_after_secs(headers: &http::header::HeaderMap) -> i64 {
     headers
-        .get(reqwest::header::RETRY_AFTER)
+        .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|&s| s > 0)
@@ -2321,7 +2611,7 @@ fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> i64 {
 }
 
 /// 从响应头解析 i64（解析失败 → None）。对应 TS `parseInt(headers.get(...))`。
-fn header_i64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+fn header_i64(headers: &http::header::HeaderMap, name: &str) -> Option<i64> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -2466,7 +2756,7 @@ fn normalize_base(input: &str, label: &str) -> Result<String> {
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-http"))]
 mod p4_tests {
     use super::*;
     use crate::auth::types::{ServerMetadata, TokenSet};
@@ -2491,7 +2781,7 @@ mod p4_tests {
 
     #[test]
     fn header_i64_parses_or_none() {
-        let mut h = reqwest::header::HeaderMap::new();
+        let mut h = http::header::HeaderMap::new();
         h.insert("X-Token-Remaining", "12345".parse().unwrap());
         h.insert("X-Bad", "nan".parse().unwrap());
         assert_eq!(header_i64(&h, "X-Token-Remaining"), Some(12345));
@@ -2501,10 +2791,10 @@ mod p4_tests {
 
     #[test]
     fn parse_retry_after_secs_filters_nonpositive() {
-        let mut h = reqwest::header::HeaderMap::new();
-        h.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        let mut h = http::header::HeaderMap::new();
+        h.insert(http::header::RETRY_AFTER, "30".parse().unwrap());
         assert_eq!(parse_retry_after_secs(&h), 30);
-        h.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        h.insert(http::header::RETRY_AFTER, "0".parse().unwrap());
         assert_eq!(parse_retry_after_secs(&h), 0);
     }
 
@@ -2697,7 +2987,7 @@ mod p4_tests {
         .unwrap();
         client.prime_tokens_for_test(unexpired_token(&base));
         let (out, _) = client
-            .do_json_full::<serde_json::Value>(reqwest::Method::GET, "/whatever", None, None)
+            .do_json_full::<serde_json::Value>(http::Method::GET, "/whatever", None, None)
             .await
             .unwrap();
         assert!(out.is_none());

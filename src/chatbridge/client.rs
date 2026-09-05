@@ -144,7 +144,7 @@ impl ChatBridgeClient {
         let (env, _) = self
             .client
             .do_json_full::<ApiResponse<serde_json::Value>>(
-                reqwest::Method::PATCH,
+                http::Method::PATCH,
                 &format!("/chat-bridge/integrations/{}/status", urlencoding(id)),
                 Some(&body),
                 signal,
