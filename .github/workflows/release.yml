@@ -58,7 +58,9 @@ jobs:
           package="acosmi-sdk-$version.crate"
           curl --fail --silent --show-error --location --retry 12 --retry-delay 5 --retry-all-errors \
             "https://static.crates.io/crates/acosmi-sdk/$package" -o "release-assets/$package"
-          cmp "target/package/$package" "release-assets/$package"
+          archive=$(find target/package -type f -name "$package" -print -quit)
+          test -n "$archive"
+          cmp "$archive" "release-assets/$package"
           (cd release-assets && sha256sum "$package" > SHA256SUMS)
           hash=$(sha256sum "release-assets/$package" | cut -d ' ' -f 1)
           jq -n --arg version "$version" --arg commit "$GITHUB_SHA" --arg sha256 "$hash" \
