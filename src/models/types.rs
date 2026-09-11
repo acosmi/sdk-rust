@@ -605,6 +605,7 @@ pub struct ChatUsage {
 
 /// 三档思考级别（v0.9.0）。
 pub const THINKING_OFF: &str = "off";
+pub const THINKING_LOW: &str = "low";
 /// 三档思考级别（v0.9.0）。
 pub const THINKING_HIGH: &str = "high";
 /// 三档思考级别（v0.9.0）。

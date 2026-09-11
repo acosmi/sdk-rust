@@ -57,7 +57,7 @@ pub fn build_request_body(_caps: &ModelCapabilities, req: &ChatRequest) -> Map<S
     // ── 扩展字段（v0.13.0：按 OpenAI wire format 直接翻译）──
 
     // Thinking / Effort → reasoning_effort
-    let eff = resolve_openai_reasoning_effort(req);
+    let eff = resolve_openai_reasoning_effort_with_max(req, _caps.supports_max_effort);
     if !eff.is_empty() {
         body.insert("reasoning_effort".to_string(), Value::String(eff));
     }
@@ -141,13 +141,18 @@ pub fn parse_stream_line(event_type: &str, data: &str) -> Result<(StreamEvent, b
 
 /// 把 thinking/effort 翻译成 OpenAI `reasoning_effort` 字段值。空串表示不设置。
 pub fn resolve_openai_reasoning_effort(req: &ChatRequest) -> String {
+    resolve_openai_reasoning_effort_with_max(req, false)
+}
+
+fn resolve_openai_reasoning_effort_with_max(req: &ChatRequest, supports_max: bool) -> String {
+    let max_effort = if supports_max { "max" } else { "high" };
     // effort 优先级最高（本身就是通用级别语义）。
     if let Some(effort) = &req.effort {
         if !effort.level.is_empty() {
             match effort.level.as_str() {
                 "low" | "medium" | "high" => return effort.level.clone(),
                 // OpenAI 无 max 级别，等价最深 = high。
-                "max" => return "high".to_string(),
+                "max" => return max_effort.to_string(),
                 _ => {}
             }
         }
@@ -155,8 +160,9 @@ pub fn resolve_openai_reasoning_effort(req: &ChatRequest) -> String {
     // thinking.level 次之。
     if let Some(thinking) = &req.thinking {
         match thinking.level.as_deref() {
+            Some("low") => return "low".to_string(),
             Some(THINKING_HIGH) => return "high".to_string(),
-            Some(THINKING_MAX) => return "high".to_string(),
+            Some(THINKING_MAX) => return max_effort.to_string(),
             Some(THINKING_OFF) => return String::new(),
             _ => {}
         }
