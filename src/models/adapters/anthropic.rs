@@ -297,6 +297,7 @@ pub fn resolve_thinking_level(
     if caps.supports_effort {
         let mut effort_level = "high";
         if level == "low" { effort_level = "low"; }
+        if level == "medium" || level == "xhigh" { effort_level = &level; }
         if level == THINKING_MAX && caps.supports_max_effort {
             effort_level = "max";
         }

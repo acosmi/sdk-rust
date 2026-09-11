@@ -61,6 +61,9 @@ pub fn build_request_body(_caps: &ModelCapabilities, req: &ChatRequest) -> Map<S
     if !eff.is_empty() {
         body.insert("reasoning_effort".to_string(), Value::String(eff));
     }
+    if _caps.supports_thinking && req.thinking.as_ref().and_then(|t| t.level.as_deref()) == Some(THINKING_OFF) {
+        body.insert("thinking".to_string(), json!({"type":"disabled"}));
+    }
 
     if let Some(speed) = &req.speed {
         if !speed.is_empty() {
@@ -150,7 +153,7 @@ fn resolve_openai_reasoning_effort_with_max(req: &ChatRequest, supports_max: boo
     if let Some(effort) = &req.effort {
         if !effort.level.is_empty() {
             match effort.level.as_str() {
-                "low" | "medium" | "high" => return effort.level.clone(),
+                "low" | "medium" | "high" | "xhigh" => return effort.level.clone(),
                 // OpenAI 无 max 级别，等价最深 = high。
                 "max" => return max_effort.to_string(),
                 _ => {}
@@ -161,6 +164,8 @@ fn resolve_openai_reasoning_effort_with_max(req: &ChatRequest, supports_max: boo
     if let Some(thinking) = &req.thinking {
         match thinking.level.as_deref() {
             Some("low") => return "low".to_string(),
+            Some("medium") => return "medium".to_string(),
+            Some("xhigh") => return "xhigh".to_string(),
             Some(THINKING_HIGH) => return "high".to_string(),
             Some(THINKING_MAX) => return max_effort.to_string(),
             Some(THINKING_OFF) => return String::new(),
