@@ -11,7 +11,7 @@ use crate::models::types::{
 use crate::models::wire_anthropic::{AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use crate::models::wire_openai::{OpenAIChatResponse, OpenAIStreamChunk};
 use crate::shared::errors::{Error, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map, Number, Value};
 
 /// 构建 OpenAI 兼容格式请求体。不注入 Anthropic betas，扩展字段以通用 JSON 传递。
 pub fn build_request_body(_caps: &ModelCapabilities, req: &ChatRequest) -> Map<String, Value> {
@@ -369,8 +369,60 @@ pub fn parse_openai_response_to_anthropic(raw: &[u8]) -> Result<AnthropicRespons
 // OpenAI SSE → Anthropic 事件转换器（供 chatMessagesStreamInternal 使用）
 // ============================================================================
 
+/// 收尾 `message_delta` 上的 usage。只含与非流式路径相同的两个键；某个键为 `None` 表示上游没给
+/// 该计数，不是 0。对应 TS `models/adapters/openai.ts` 的 `StreamMessageUsage`。
+#[derive(Debug)]
+struct StreamMessageUsage {
+    input_tokens: Option<Number>,
+    output_tokens: Option<Number>,
+}
+
+impl StreamMessageUsage {
+    /// 序列化为 `message_delta.usage` 对象，只写在场的键。
+    fn to_json(&self) -> Value {
+        let mut usage = Map::new();
+        if let Some(n) = &self.input_tokens {
+            usage.insert("input_tokens".to_string(), Value::Number(n.clone()));
+        }
+        if let Some(n) = &self.output_tokens {
+            usage.insert("output_tokens".to_string(), Value::Number(n.clone()));
+        }
+        Value::Object(usage)
+    }
+}
+
+/// 读出一帧流式 chunk 上的 usage 对象，搬成收尾 `message_delta` 的 usage 形态。对应 TS
+/// `models/adapters/openai.ts` 的 `readStreamUsage`。
+///
+/// 字段映射与同文件非流式路径（`convert_openai_to_chat_response` /
+/// `parse_openai_response_to_anthropic`）逐字相同：只搬 `prompt_tokens → input_tokens`、
+/// `completion_tokens → output_tokens`，数值原样。`cached_tokens` / `reasoning_tokens` 等明细刻意
+/// 不映射，也不做 `prompt_tokens − cached` 之类的净额换算——usage 的语义归一只在网关，SDK 只做
+/// 格式搬运。某个计数缺席或不是 JSON 数字时不写对应键。
+///
+/// 入参是帧上原始的 `usage` 值，而不是 `OpenAIStreamChunk::usage`：后者的 `OpenAIUsage` 要求
+/// 三个计数都在且为整数，既表达不了「计数缺席」，遇到缺 `total_tokens` 之类的形态还会让整帧
+/// 反序列化失败。
+///
+/// 帧上没有 usage 对象（缺失 / `null` / 非对象）返回 `None`：调用方据此区分「这帧没带 usage」与
+/// 「带了 usage 但计数都缺席」（后者返回两个键都为 `None` 的值，仍算见过 usage）。
+fn read_stream_usage(raw: Option<&Value>) -> Option<StreamMessageUsage> {
+    let usage = raw?.as_object()?;
+    let count = |key: &str| match usage.get(key) {
+        Some(Value::Number(n)) => Some(n.clone()),
+        _ => None,
+    };
+    Some(StreamMessageUsage {
+        input_tokens: count("prompt_tokens"),
+        output_tokens: count("completion_tokens"),
+    })
+}
+
 /// 将 OpenAI SSE chunks 转换为 Anthropic 兼容的 [`StreamEvent`]。
-/// 有状态：跨 chunk 追踪 block 索引。
+/// 有状态：跨 chunk 追踪 block 索引，以及为等待 usage 尾帧而推迟的收尾。
+///
+/// 流在没有 `[DONE]` 的情况下正常结束（EOF）时，驱动方须在读循环结束后调用一次
+/// [`OpenAIStreamConverter::flush`]，否则推迟中的 `message_delta` + `message_stop` 永远不会发出。
 #[derive(Debug, Default)]
 pub struct OpenAIStreamConverter {
     message_started: bool,
@@ -384,6 +436,18 @@ pub struct OpenAIStreamConverter {
     /// 用插入有序的 `Vec<(key, value)>` 复刻 JS `Map` 的迭代顺序（finish 时按插入序关闭 tool block）。
     tool_block_index: Vec<(i64, i64)>,
     block_index: i64,
+    /// 已发出 message_delta/message_stop（对应 TS `messageClosed`）：finish_reason、usage 尾帧、
+    /// `[DONE]` 与 `flush` 共用它防重复收口——整条流恰好一个 message_stop。
+    message_closed: bool,
+    /// 已为仍打开的块发出 content_block_stop（对应 TS `blocksClosed`）。与 `message_closed` 分开记：
+    /// 块在 finish_reason 帧上就关，message_delta/message_stop 却可能推迟到之后的帧。
+    blocks_closed: bool,
+    /// finish_reason 已到、但 message_delta/message_stop 因等待 usage 尾帧而推迟时记下的 stop_reason
+    /// （对应 TS `pendingStopReason`）；没有推迟中的收尾时为 `None`。
+    pending_stop_reason: Option<&'static str>,
+    /// 最近一次带 usage 对象的帧搬出的 usage，后到覆盖先到（对应 TS `usage`）；整条流从未出现
+    /// usage 对象时为 `None`，收尾 message_delta 据此不写 usage 键。
+    usage: Option<StreamMessageUsage>,
 }
 
 impl OpenAIStreamConverter {
@@ -392,19 +456,121 @@ impl OpenAIStreamConverter {
         Self::default()
     }
 
+    /// 关闭仍打开的 text / thinking / tool 块，整条流只关一次（对应 TS `closeContentBlocks`）。
+    ///
+    /// 由 finish_reason 分支与 `[DONE]` 分支共用。此前关块与 message_delta/message_stop 是
+    /// finish_reason 分支里同一时刻的事；usage 尾帧要求收尾推迟，于是拆成本方法与
+    /// `emit_message_end` 两段，各自防重。
+    fn close_content_blocks(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.blocks_closed {
+            return;
+        }
+        self.blocks_closed = true;
+
+        if self.text_started {
+            let stop_json = json!({
+                "type": "content_block_stop",
+                "index": self.block_index,
+            })
+            .to_string();
+            events.push(ev("content_block_stop", stop_json));
+        } else if self.thinking_started && !self.thinking_stopped {
+            // 用 thinking_block_index 关 —— thinking-only 流末尾若有 tool block 推进过 block_index，
+            // 这里仍要用 thinking 自己打开时记下的 index，否则错配。
+            self.thinking_stopped = true;
+            let stop_json = json!({
+                "type": "content_block_stop",
+                "index": self.thinking_block_index,
+            })
+            .to_string();
+            events.push(ev("content_block_stop", stop_json));
+        }
+        // 关闭 tool blocks（按插入序，复刻 JS Map 迭代序）。
+        for (_, idx) in &self.tool_block_index {
+            let stop_json = json!({
+                "type": "content_block_stop",
+                "index": idx,
+            })
+            .to_string();
+            events.push(ev("content_block_stop", stop_json));
+        }
+    }
+
+    /// 发出 message_delta + message_stop，整条流只发一次；同时清掉推迟中的收尾（对应 TS
+    /// `emitMessageEnd`）。
+    ///
+    /// 见过 usage 对象就把它放进 message_delta：usage 必须出现在唯一的 message_stop 之前，
+    /// message_stop 之后下游已无处安放用量。整条流从未出现 usage 对象时不写 usage 键——缺席
+    /// 表示「上游没给」，不是 0。
+    fn emit_message_end(&mut self, events: &mut Vec<StreamEvent>, stop_reason: &str) {
+        if self.message_closed {
+            return;
+        }
+        self.message_closed = true;
+        self.pending_stop_reason = None;
+
+        let mut delta_json = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": stop_reason },
+        });
+        if let Some(usage) = &self.usage {
+            delta_json["usage"] = usage.to_json();
+        }
+        events.push(ev("message_delta", delta_json.to_string()));
+
+        let stop_json = json!({ "type": "message_stop" }).to_string();
+        events.push(ev("message_stop", stop_json));
+    }
+
     /// 将一行 OpenAI SSE data 转换为零或多个 Anthropic 格式 StreamEvent。返回 `(events, done)`。
     pub fn convert(&mut self, data: &str) -> Result<(Vec<StreamEvent>, bool)> {
         if data == "[DONE]" {
-            return Ok((Vec::new(), true));
+            // 上游可能在 `[DONE]` 之前不发 finish_reason（部分兼容实现、被中断的流）。此前这里直接
+            // 返回空事件，已打开的块永不闭合，下游也收不到 message_stop。
+            let mut events: Vec<StreamEvent> = Vec::new();
+            if let Some(stop_reason) = self.pending_stop_reason {
+                // finish_reason 已到而 usage 尾帧始终没来：流已声明结束，推迟的收尾不能再等
+                // （块已在 finish_reason 帧上关过）。
+                self.emit_message_end(&mut events, stop_reason);
+            } else if self.message_started {
+                self.close_content_blocks(&mut events);
+                self.emit_message_end(&mut events, "end_turn");
+            }
+            return Ok((events, true));
         }
 
-        let chunk: OpenAIStreamChunk = serde_json::from_str(data)
+        let mut frame: Value = serde_json::from_str(data)
             .map_err(|e| Error::other(format!("parse openai stream chunk: {e}")))?;
+        // usage 按原始 JSON 读（见 `read_stream_usage`），先从帧上取下再做类型化反序列化：
+        // 不让 `OpenAIUsage` 的必填计数决定整帧能否解析。
+        let raw_usage = frame.as_object_mut().and_then(|obj| obj.remove("usage"));
+        let chunk: OpenAIStreamChunk = serde_json::from_value(frame)
+            .map_err(|e| Error::other(format!("parse openai stream chunk: {e}")))?;
+
+        // usage 必须在「没有 choices 就返回」之前读：`stream_options.include_usage` 的尾帧恰恰是
+        // `{"choices":[],"usage":{...}}`。此前先判 choices 再返回、且从不读 usage，尾帧整帧丢弃，
+        // 经本 SDK 走 OpenAI 线的流式调用 usage 恒缺。对应 TS `OpenAIStreamConverter.convert`。
+        let frame_carries_usage = match read_stream_usage(raw_usage.as_ref()) {
+            Some(usage) => {
+                self.usage = Some(usage); // 后到覆盖先到
+                true
+            }
+            None => false,
+        };
 
         let mut events: Vec<StreamEvent> = Vec::new();
         let choice = match chunk.choices.first() {
             Some(c) => c,
-            None => return Ok((events, false)),
+            None => {
+                // 没有 choices 的 data 帧（网关错误契约帧、usage 尾帧）不产出内容事件：带 usage 且有
+                // 推迟中的收尾时在这里补发，不带 usage 的零事件。
+                if frame_carries_usage {
+                    if let Some(stop_reason) = self.pending_stop_reason {
+                        self.emit_message_end(&mut events, stop_reason);
+                    }
+                }
+                return Ok((events, false));
+            }
         };
 
         // 首个 chunk：发送 message_start。
@@ -544,57 +710,55 @@ impl OpenAIStreamConverter {
             }
         }
 
-        // finish_reason：关闭所有 block + message_delta + message_stop。
+        // finish_reason：关闭所有 block；message_delta + message_stop 视 usage 是否已到，立即发或推迟。
         let finish = choice.finish_reason.as_deref().unwrap_or("");
         if !finish.is_empty() {
-            // 关闭可能仍打开的 block。
-            if self.text_started {
-                let stop_json = json!({
-                    "type": "content_block_stop",
-                    "index": self.block_index,
-                })
-                .to_string();
-                events.push(ev("content_block_stop", stop_json));
-            } else if self.thinking_started && !self.thinking_stopped {
-                // 用 thinking_block_index 关 —— thinking-only 流末尾若有 tool block 推进过 block_index，
-                // 这里仍要用 thinking 自己打开时记下的 index，否则错配。
-                self.thinking_stopped = true;
-                let stop_json = json!({
-                    "type": "content_block_stop",
-                    "index": self.thinking_block_index,
-                })
-                .to_string();
-                events.push(ev("content_block_stop", stop_json));
-            }
-            // 关闭 tool blocks（按插入序，复刻 JS Map 迭代序）。
-            for (_, idx) in &self.tool_block_index {
-                let stop_json = json!({
-                    "type": "content_block_stop",
-                    "index": idx,
-                })
-                .to_string();
-                events.push(ev("content_block_stop", stop_json));
-            }
-
             // stop_reason 映射。
             let stop_reason = match finish {
                 "tool_calls" => "tool_use",
                 "length" => "max_tokens",
                 _ => "end_turn",
             };
+            // 只认第一个 finish_reason：收尾已发出或已推迟时，后到的 finish_reason 既不改写
+            // stop_reason，也不再关块。
+            if !self.message_closed && self.pending_stop_reason.is_none() {
+                self.close_content_blocks(&mut events);
+                if self.usage.is_some() {
+                    // usage 已在本帧或更早的帧到达：一次发出带 usage 的收尾。
+                    self.emit_message_end(&mut events, stop_reason);
+                } else {
+                    // `include_usage` 的标准帧序里 finish_reason 帧先于 usage 尾帧。此刻收尾，
+                    // message_delta 只能不带 usage，之后到的 usage 已无处安放——于是推迟到 usage 帧 /
+                    // `[DONE]` / EOF（`flush`）三者先到者。块照常在这一帧关闭。
+                    self.pending_stop_reason = Some(stop_reason);
+                }
+            }
+        }
 
-            let delta_json = json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": stop_reason },
-            })
-            .to_string();
-            events.push(ev("message_delta", delta_json));
-
-            let stop_json = json!({ "type": "message_stop" }).to_string();
-            events.push(ev("message_stop", stop_json));
+        // 推迟收尾期间到达的带 choices 帧若携带 usage，同样立即补发。
+        if frame_carries_usage {
+            if let Some(stop_reason) = self.pending_stop_reason {
+                self.emit_message_end(&mut events, stop_reason);
+            }
         }
 
         Ok((events, false))
+    }
+
+    /// 流在**没有** `[DONE]` 的情况下正常结束（EOF）时，由驱动方在读循环结束后调用一次。对应 TS
+    /// `OpenAIStreamConverter.flush`。
+    ///
+    /// 只补发「finish_reason 已到、仅因等待 usage 尾帧而推迟」的 `message_delta` + `message_stop`。
+    /// 从未收到 finish_reason 的流是被截断的流，这里刻意**不**替它伪造正常结束——一个 `end_turn`
+    /// 的 `message_stop` 会把被截断的回答当成完整回答交给下游。已经收口（usage 帧 / `[DONE]` /
+    /// 上一次 `flush`）后再调用返回空，不会发出第二个 `message_stop`。读取出错或被取消的流不应
+    /// 调用本方法。
+    pub fn flush(&mut self) -> Vec<StreamEvent> {
+        let mut events: Vec<StreamEvent> = Vec::new();
+        if let Some(stop_reason) = self.pending_stop_reason {
+            self.emit_message_end(&mut events, stop_reason);
+        }
+        events
     }
 }
 
@@ -616,6 +780,7 @@ mod tests {
     use super::*;
     use crate::models::types::{ChatMessage, EffortConfig};
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn caps() -> ModelCapabilities {
         ModelCapabilities::default()
@@ -698,5 +863,565 @@ mod tests {
         // [DONE]
         let (_, d) = conv.convert("[DONE]").unwrap();
         assert!(d);
+    }
+
+    // ---- 流式 usage 尾帧与收尾：端口自 TS `core/openai-line-stream-usage.test.ts` 的转换器用例 ----
+
+    /// `stream_options.include_usage` 的 usage 尾帧：`[DONE]` 之前、没有 choices，带缓存 / 推理明细。
+    const USAGE_TAIL_FRAME: &str = r#"{"choices":[],"usage":{"prompt_tokens":13171,"completion_tokens":16,"total_tokens":13187,"completion_tokens_details":{"reasoning_tokens":14},"prompt_tokens_details":{"cached_tokens":13056}}}"#;
+
+    /// 网关以 `event: failed` 发出的错误契约帧（取自 TS `core/openai-line-stream-error.test.ts`）：
+    /// 没有 `id` / `object` / `choices`。
+    const GATEWAY_FAILED_FRAME: &str = r#"{"type":"managed_model_stream_failed","protocol":"managed-model.v2","stage":"provider","error":"gateway: tools[0].type:type cannot be empty. (kind=invalid_request, status=400)","errorCode":"invalid_request","errorContractVersion":1,"faultDomain":"provider","message":"","requestDisposition":"unknown","retryable":false,"requestId":"req-0001","consumeRequestId":"req-0001","providerRequestId":"prov-0001","transportRequestId":"trans-0001"}"#;
+
+    type Parsed = Vec<(String, Value)>;
+
+    fn content_chunk(text: &str) -> String {
+        json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
+        })
+        .to_string()
+    }
+
+    fn finish_chunk(reason: &str, usage: Option<Value>) -> String {
+        let mut chunk = json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": reason }],
+        });
+        if let Some(usage) = usage {
+            chunk["usage"] = usage;
+        }
+        chunk.to_string()
+    }
+
+    fn parse_events(events: &[StreamEvent]) -> Parsed {
+        events
+            .iter()
+            .map(|e| (e.event.clone(), serde_json::from_str(&e.data).unwrap()))
+            .collect()
+    }
+
+    fn event_names(events: &[(String, Value)]) -> Vec<&str> {
+        events.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    fn count_events(events: &[(String, Value)], name: &str) -> usize {
+        events.iter().filter(|(n, _)| n == name).count()
+    }
+
+    /// 逐帧喂入转换器，同时记下每一帧各自产出的事件名——断言「收尾在哪一帧发出」要用。
+    fn feed(frames: &[&str]) -> (Vec<Vec<String>>, Parsed) {
+        let mut conv = new_openai_stream_converter();
+        let mut steps = Vec::new();
+        let mut all = Vec::new();
+        for frame in frames {
+            let parsed = parse_events(&conv.convert(frame).unwrap().0);
+            steps.push(parsed.iter().map(|(name, _)| name.clone()).collect());
+            all.extend(parsed);
+        }
+        (steps, all)
+    }
+
+    /// 整条流恰好一个 message_delta 与一个 message_stop，message_stop 收尾且 message_delta 紧挨在
+    /// 它之前。返回那个 message_delta 的 JSON。
+    fn expect_single_close_at_end(all: &[(String, Value)]) -> &Value {
+        let names = event_names(all);
+        assert_eq!(count_events(all, "message_delta"), 1, "{names:?}");
+        assert_eq!(count_events(all, "message_stop"), 1, "{names:?}");
+        let stop_at = names.iter().position(|n| *n == "message_stop").unwrap();
+        assert_eq!(stop_at, names.len() - 1, "{names:?}");
+        assert_eq!(names[stop_at - 1], "message_delta", "{names:?}");
+        &all[stop_at - 1].1
+    }
+
+    #[test]
+    fn usage_tail_after_finish_reason_defers_close_to_tail_frame() {
+        let (steps, all) = feed(&[
+            &content_chunk("PONG"),
+            &finish_chunk("stop", None),
+            USAGE_TAIL_FRAME,
+            "[DONE]",
+        ]);
+        assert_eq!(steps[1], ["content_block_stop"]); // finish_reason 帧只关块
+        assert_eq!(steps[2], ["message_delta", "message_stop"]); // 尾帧到达即收尾
+        assert!(steps[3].is_empty()); // [DONE] 不重复收口
+        assert_eq!(count_events(&all, "content_block_stop"), 1); // 块只关一次
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "end_turn" }));
+        assert_eq!(
+            delta["usage"],
+            json!({ "input_tokens": 13171, "output_tokens": 16 })
+        );
+    }
+
+    #[test]
+    fn usage_in_finish_reason_frame_closes_in_that_frame() {
+        let finish = finish_chunk(
+            "length",
+            Some(json!({ "prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23 })),
+        );
+        let (steps, all) = feed(&[&content_chunk("PONG"), &finish, "[DONE]"]);
+        assert_eq!(
+            steps[1],
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert!(steps[2].is_empty());
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "max_tokens" }));
+        assert_eq!(
+            delta["usage"],
+            json!({ "input_tokens": 20, "output_tokens": 3 })
+        );
+    }
+
+    #[test]
+    fn usage_on_choices_frame_during_deferral_closes_in_that_frame() {
+        // 没有 `object` 键：同时覆盖 `OpenAIStreamChunk::object` 的缺省。
+        let usage_frame = json!({
+            "id": "c1",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": null }],
+            "usage": { "prompt_tokens": 30, "completion_tokens": 4, "total_tokens": 34 },
+        })
+        .to_string();
+        let (steps, all) = feed(&[
+            &content_chunk("PONG"),
+            &finish_chunk("stop", None),
+            &usage_frame,
+            "[DONE]",
+        ]);
+        assert_eq!(steps[1], ["content_block_stop"]);
+        assert_eq!(steps[2], ["message_delta", "message_stop"]);
+        assert!(steps[3].is_empty());
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(
+            delta["usage"],
+            json!({ "input_tokens": 30, "output_tokens": 4 })
+        );
+    }
+
+    #[test]
+    fn usage_before_finish_reason_closes_at_finish_with_latest_usage() {
+        // 两帧 usage 都没有 `total_tokens`：`OpenAIUsage` 的必填计数不得让整帧解析失败。
+        let content_with_usage = |text: &str, completion_tokens: i64| {
+            json!({
+                "id": "c1",
+                "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
+                "usage": { "prompt_tokens": 7, "completion_tokens": completion_tokens },
+            })
+            .to_string()
+        };
+        let (steps, all) = feed(&[
+            &content_with_usage("PO", 1),
+            &content_with_usage("NG", 2),
+            &finish_chunk("stop", None),
+            "[DONE]",
+        ]);
+        assert_eq!(
+            steps[2],
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        let delta = expect_single_close_at_end(&all);
+        // 后到覆盖先到。
+        assert_eq!(
+            delta["usage"],
+            json!({ "input_tokens": 7, "output_tokens": 2 })
+        );
+    }
+
+    #[test]
+    fn finish_reason_without_usage_closes_at_done_without_usage_key() {
+        let (steps, all) = feed(&[
+            &content_chunk("PONG"),
+            &finish_chunk("stop", None),
+            "[DONE]",
+        ]);
+        assert_eq!(steps[1], ["content_block_stop"]);
+        assert_eq!(steps[2], ["message_delta", "message_stop"]);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "end_turn" }));
+        assert!(delta.get("usage").is_none());
+    }
+
+    #[test]
+    fn only_first_finish_reason_counts() {
+        // 推迟期间再来 finish_reason：不再关块，也不改写 stop_reason。
+        let (steps, all) = feed(&[
+            &content_chunk("PONG"),
+            &finish_chunk("length", None),
+            &finish_chunk("stop", None),
+            USAGE_TAIL_FRAME,
+            "[DONE]",
+        ]);
+        assert!(steps[2].is_empty());
+        assert_eq!(steps[3], ["message_delta", "message_stop"]);
+        assert_eq!(count_events(&all, "content_block_stop"), 1);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "max_tokens" }));
+
+        // 收尾已发出后再来 finish_reason：零事件。
+        let finish_with_usage = finish_chunk(
+            "stop",
+            Some(json!({ "prompt_tokens": 1, "completion_tokens": 1 })),
+        );
+        let (steps, _) = feed(&[
+            &content_chunk("PONG"),
+            &finish_with_usage,
+            &finish_chunk("length", None),
+        ]);
+        assert_eq!(
+            steps[1],
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert!(steps[2].is_empty());
+    }
+
+    #[test]
+    fn flush_emits_deferred_close_at_eof_exactly_once() {
+        let mut conv = new_openai_stream_converter();
+        let mut all = parse_events(&conv.convert(&content_chunk("PONG")).unwrap().0);
+        all.extend(parse_events(
+            &conv.convert(&finish_chunk("stop", None)).unwrap().0,
+        ));
+        let flushed = parse_events(&conv.flush());
+        assert_eq!(event_names(&flushed), ["message_delta", "message_stop"]);
+        all.extend(flushed);
+        assert!(conv.flush().is_empty());
+        let delta = expect_single_close_at_end(&all);
+        assert!(delta.get("usage").is_none());
+    }
+
+    #[test]
+    fn flush_after_usage_tail_close_is_empty() {
+        let mut conv = new_openai_stream_converter();
+        conv.convert(&content_chunk("PONG")).unwrap();
+        conv.convert(&finish_chunk("stop", None)).unwrap();
+        // 正向对照：尾帧确实触发了收尾，「flush 返回空」不是因为压根没收尾。
+        let tail = parse_events(&conv.convert(USAGE_TAIL_FRAME).unwrap().0);
+        assert_eq!(event_names(&tail), ["message_delta", "message_stop"]);
+        assert!(conv.flush().is_empty());
+    }
+
+    #[test]
+    fn flush_does_not_fake_normal_end_for_truncated_stream() {
+        let mut conv = new_openai_stream_converter();
+        // 正向对照：流确实开过块，「flush 返回空」不是因为转换器什么都没做。
+        let opened = parse_events(&conv.convert(&content_chunk("PART")).unwrap().0);
+        assert_eq!(
+            event_names(&opened),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert!(conv.flush().is_empty());
+    }
+
+    #[test]
+    fn frames_without_choices_or_usage_emit_nothing_and_do_not_close_early() {
+        let mut conv = new_openai_stream_converter();
+        let no_choices_no_usage = r#"{"type":"managed_model_stream_failed","message":""}"#;
+        let empty_choices_null_usage = r#"{"id":"c1","choices":[],"usage":null}"#;
+
+        // 流开头。
+        assert!(conv.convert(no_choices_no_usage).unwrap().0.is_empty());
+        conv.convert(&content_chunk("PONG")).unwrap();
+        let at_finish = parse_events(&conv.convert(&finish_chunk("stop", None)).unwrap().0);
+        assert_eq!(event_names(&at_finish), ["content_block_stop"]);
+        // 推迟期间：不带 usage 的帧不提前触发收尾；`usage: null` 不是 usage 对象。
+        assert!(conv.convert(no_choices_no_usage).unwrap().0.is_empty());
+        assert!(conv.convert(empty_choices_null_usage).unwrap().0.is_empty());
+
+        let (end, done) = conv.convert("[DONE]").unwrap();
+        assert!(done);
+        let end = parse_events(&end);
+        assert_eq!(event_names(&end), ["message_delta", "message_stop"]);
+        assert!(end[0].1.get("usage").is_none());
+    }
+
+    #[test]
+    fn usage_frame_without_choices_key_closes_deferred_message() {
+        // 既没有 choices 也没有 id / object、只带 usage 的帧，同样补发推迟中的收尾。
+        let bare_usage = r#"{"usage":{"prompt_tokens":5,"completion_tokens":6}}"#;
+        let (steps, all) = feed(&[
+            &content_chunk("PONG"),
+            &finish_chunk("stop", None),
+            bare_usage,
+            "[DONE]",
+        ]);
+        assert_eq!(steps[2], ["message_delta", "message_stop"]);
+        assert!(steps[3].is_empty());
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(
+            delta["usage"],
+            json!({ "input_tokens": 5, "output_tokens": 6 })
+        );
+    }
+
+    #[test]
+    fn cached_and_reasoning_details_are_neither_mapped_nor_netted() {
+        let (_, all) = feed(&[
+            &content_chunk("PONG"),
+            &finish_chunk("stop", None),
+            USAGE_TAIL_FRAME,
+            "[DONE]",
+        ]);
+        let usage = expect_single_close_at_end(&all)["usage"]
+            .as_object()
+            .unwrap();
+        let mut keys: Vec<&str> = usage.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["input_tokens", "output_tokens"]);
+        assert!(!usage.contains_key("cache_read_input_tokens"));
+        // 原样搬运，不是 13171 − 13056。
+        assert_eq!(usage["input_tokens"], json!(13171));
+    }
+
+    #[test]
+    fn missing_or_non_numeric_counts_are_omitted_not_zero() {
+        let usage_of = |usage: Value| {
+            let tail = json!({ "choices": [], "usage": usage }).to_string();
+            let (_, all) = feed(&[
+                &content_chunk("PONG"),
+                &finish_chunk("stop", None),
+                &tail,
+                "[DONE]",
+            ]);
+            expect_single_close_at_end(&all)["usage"].clone()
+        };
+        assert_eq!(
+            usage_of(json!({ "prompt_tokens": null, "completion_tokens": 16 })),
+            json!({ "output_tokens": 16 })
+        );
+        assert_eq!(
+            usage_of(json!({ "prompt_tokens": 12, "completion_tokens": "16" })),
+            json!({ "input_tokens": 12 })
+        );
+    }
+
+    #[test]
+    fn non_object_usage_is_not_usage() {
+        // 只接受对象形态：数组 / 数字形态的 usage 与没有 usage 相同，不触发推迟中的收尾。
+        for usage in [json!([13171, 16]), json!(29)] {
+            let tail = json!({ "choices": [], "usage": usage }).to_string();
+            let (steps, all) = feed(&[
+                &content_chunk("PONG"),
+                &finish_chunk("stop", None),
+                &tail,
+                "[DONE]",
+            ]);
+            assert!(steps[2].is_empty(), "{usage}");
+            assert_eq!(steps[3], ["message_delta", "message_stop"], "{usage}");
+            assert!(
+                expect_single_close_at_end(&all).get("usage").is_none(),
+                "{usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_error_frame_without_choices_parses_to_zero_events() {
+        // 端口自 TS `core/openai-line-stream-error.test.ts` 的转换器用例。
+        let mut conv = new_openai_stream_converter();
+        // 形态一：完全没有 id / object / choices（网关错误契约帧）。
+        assert!(conv.convert(GATEWAY_FAILED_FRAME).unwrap().0.is_empty());
+        assert!(conv.convert(GATEWAY_FAILED_FRAME).unwrap().0.is_empty());
+        // 形态二：choices 为空数组的 usage-only 帧。零事件是因为没有推迟中的收尾（从未收到
+        // finish_reason）；usage 被记下而非丢弃，随之后的收尾带出。
+        let usage_only = r#"{"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        assert!(conv.convert(usage_only).unwrap().0.is_empty());
+        conv.convert(&content_chunk("PONG")).unwrap();
+        let end = parse_events(&conv.convert(&finish_chunk("stop", None)).unwrap().0);
+        assert_eq!(
+            event_names(&end),
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert_eq!(
+            end[1].1["usage"],
+            json!({ "input_tokens": 1, "output_tokens": 1 })
+        );
+    }
+
+    // ---- block 配对：端口自 TS `test/openai-stream-converter.test.ts` ----
+    // 收尾关块的逻辑已抽到 `close_content_blocks`，这组用例守住各种块顺序下 start/stop 的配对，以及
+    // `[DONE]` 收口。Rust 的 `OpenAIStreamChoice` 要求 `index`，夹具比 TS 版多写这一个键。
+
+    fn thinking_chunk(text: &str) -> String {
+        json!({ "id": "c1", "choices": [{ "index": 0, "delta": { "reasoning_content": text } }] })
+            .to_string()
+    }
+
+    fn tool_call_chunk(index: i64, id: &str, name: &str, args: &str) -> String {
+        json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        { "index": index, "id": id, "function": { "name": name, "arguments": args } }
+                    ],
+                },
+            }],
+        })
+        .to_string()
+    }
+
+    /// 喂完即流结束（EOF），与驱动方读循环结束处一致地调 `flush`。
+    fn run_chunks(chunks: &[&str]) -> Parsed {
+        let mut conv = new_openai_stream_converter();
+        let mut all = Vec::new();
+        for chunk in chunks {
+            all.extend(parse_events(&conv.convert(chunk).unwrap().0));
+        }
+        all.extend(parse_events(&conv.flush()));
+        all
+    }
+
+    /// 校验 content_block start/stop 严格配对、delta 只指向打开的块、同一 index 不被两种块复用，
+    /// 且流末没有悬挂的块。返回每种块类型依次占用的 index。
+    fn assert_blocks_well_formed(events: &[(String, Value)]) -> HashMap<String, Vec<i64>> {
+        let mut open: HashMap<i64, String> = HashMap::new();
+        let mut type_of_index: HashMap<i64, String> = HashMap::new();
+        let mut start_index_by_type: HashMap<String, Vec<i64>> = HashMap::new();
+        for (name, payload) in events {
+            match name.as_str() {
+                "content_block_start" => {
+                    let index = payload["index"].as_i64().unwrap();
+                    let block_type = payload["content_block"]["type"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    if let Some(previous) = type_of_index.get(&index) {
+                        assert_eq!(previous, &block_type, "index {index} 被不同类型的块复用");
+                    }
+                    assert!(!open.contains_key(&index), "index {index} 已打开却又 start");
+                    open.insert(index, block_type.clone());
+                    type_of_index.insert(index, block_type.clone());
+                    start_index_by_type
+                        .entry(block_type)
+                        .or_default()
+                        .push(index);
+                }
+                "content_block_stop" => {
+                    let index = payload["index"].as_i64().unwrap();
+                    assert!(
+                        open.remove(&index).is_some(),
+                        "index {index} stop 但未处于打开态"
+                    );
+                }
+                "content_block_delta" => {
+                    let index = payload["index"].as_i64().unwrap();
+                    assert!(
+                        open.contains_key(&index),
+                        "delta index {index} 不指向打开的块"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "仍有未关闭的块: {open:?}");
+        start_index_by_type
+    }
+
+    #[test]
+    fn thinking_then_tool_calls_do_not_share_an_index() {
+        let events = run_chunks(&[
+            &thinking_chunk("let me think"),
+            &thinking_chunk(" more"),
+            &tool_call_chunk(0, "call_1", "get_weather", r#"{"city":"#),
+            &tool_call_chunk(0, "call_1", "get_weather", r#""sf"}"#),
+            &finish_chunk("tool_calls", None),
+        ]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["thinking"], [0]);
+        assert_eq!(by_type["tool_use"], [1]);
+        assert_eq!(
+            events.last().map(|(name, _)| name.as_str()),
+            Some("message_stop")
+        );
+    }
+
+    #[test]
+    fn thinking_text_tool_take_sequential_indexes() {
+        let events = run_chunks(&[
+            &thinking_chunk("reasoning"),
+            &content_chunk("hello"),
+            &tool_call_chunk(0, "call_1", "fn", "{}"),
+            &finish_chunk("tool_calls", None),
+        ]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["thinking"], [0]);
+        assert_eq!(by_type["text"], [1]);
+        assert_eq!(by_type["tool_use"], [2]);
+    }
+
+    #[test]
+    fn text_only_block_pairs() {
+        let events = run_chunks(&[
+            &content_chunk("hi"),
+            &content_chunk(" there"),
+            &finish_chunk("stop", None),
+        ]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["text"], [0]);
+        assert!(!by_type.contains_key("thinking"));
+    }
+
+    #[test]
+    fn thinking_only_block_closes_at_its_own_index() {
+        let events = run_chunks(&[&thinking_chunk("think"), &finish_chunk("stop", None)]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["thinking"], [0]);
+    }
+
+    #[test]
+    fn multiple_tool_calls_take_their_own_indexes() {
+        let events = run_chunks(&[
+            &thinking_chunk("plan"),
+            &tool_call_chunk(0, "c0", "a", "{}"),
+            &tool_call_chunk(1, "c1", "b", "{}"),
+            &finish_chunk("tool_calls", None),
+        ]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["thinking"], [0]);
+        assert_eq!(by_type["tool_use"], [1, 2]);
+    }
+
+    #[test]
+    fn done_without_finish_reason_closes_blocks_and_ends_turn() {
+        let mut conv = new_openai_stream_converter();
+        let mut all = parse_events(
+            &conv
+                .convert(&tool_call_chunk(0, "call_1", "f", r#"{"a":1}"#))
+                .unwrap()
+                .0,
+        );
+        let (end, done) = conv.convert("[DONE]").unwrap();
+        assert!(done);
+        let end = parse_events(&end);
+        assert_eq!(
+            event_names(&end),
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        all.extend(end);
+        assert_blocks_well_formed(&all);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "end_turn" }));
+    }
+
+    #[test]
+    fn done_after_finish_reason_does_not_close_twice() {
+        let (steps, all) = feed(&[
+            &tool_call_chunk(0, "call_1", "f", r#"{"a":1}"#),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert_eq!(steps[2], ["message_delta", "message_stop"]);
+        assert_blocks_well_formed(&all);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "tool_use" }));
     }
 }

@@ -62,12 +62,23 @@ pub struct OpenAIUsage {
 }
 
 /// OpenAI SSE delta 格式。
+///
+/// `id` / `object` / `choices` 反序列化时可缺省（缺省即空值），序列化形态不变。线上确实存在没有
+/// 这些字段的 data 帧：网关的错误契约帧，以及部分兼容实现的 usage-only 尾帧（证据见 TS
+/// `models/wire-openai.ts` 同名类型 `choices` 字段的注释）。此前三者都是必填，这类帧在反序列化
+/// 这一步就报错，整条流随之失败。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAIStreamChunk {
+    #[serde(default)]
     pub id: String,
     /// "chat.completion.chunk"
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub choices: Vec<OpenAIStreamChoice>,
+    /// 按 `stream_options.include_usage` 的帧序，非尾帧上为 null 或缺失，带值的是 `[DONE]` 之前的
+    /// 尾帧 `{"choices":[],"usage":{...}}`。流式转换器不经本字段读 usage：[`OpenAIUsage`] 要求
+    /// 三个计数都在且为整数，表达不了流式帧上计数缺席的形态。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<OpenAIUsage>,
 }

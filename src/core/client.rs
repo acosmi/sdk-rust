@@ -2498,6 +2498,15 @@ impl Client {
                 } else if let Some(rest) = line.strip_prefix("data:") {
                     let data = rest.trim();
                     if let Some(conv) = converter.as_mut() {
+                        // 网关的结构化失败帧带 `event: failed` 发出，帧上没有 choices。判据与同文件
+                        // `chat_stream_with_usage_with_options` 同源（经 `parse_stream_error` 转
+                        // `Error::Stream`），对应 TS `chatMessagesStreamGen` OpenAI 分支的事件名判断。
+                        // 转换器对没有 choices 的帧返回零事件；不在这里分流，失败帧会被静默吞掉，
+                        // 读循环随后在 EOF 调 `flush`，finish_reason 之后的失败还会以一个看似正常的
+                        // message_stop 收场。
+                        if current_event == "failed" || current_event == "error" {
+                            Err(Error::Stream(parse_stream_error(data)))?;
+                        }
                         // OpenAI SSE → Anthropic 兼容事件。
                         let (events, done) = conv.convert(data)?;
                         for ev in events {
@@ -2522,6 +2531,16 @@ impl Client {
                         }
                         yield ev;
                     }
+                }
+            }
+            // 走到这里 = 流在没有 `[DONE]` 的情况下正常结束（EOF）。finish_reason 帧之后，转换器可能
+            // 还压着一次为等待 usage 尾帧而推迟的 message_delta + message_stop，不在这里补发，下游就
+            // 永远收不到 message_stop；从未收到 finish_reason 的截断流，flush 不产出任何事件。读取出错
+            // 与取消经上面的 `?` 提前结束，不会到达这里。对应 TS `chatMessagesStreamGen` 读循环结束处
+            // 的 `converter.flush()`。
+            if let Some(conv) = converter.as_mut() {
+                for ev in conv.flush() {
+                    yield ev;
                 }
             }
         })

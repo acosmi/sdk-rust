@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [Unreleased]
+
+### Added
+
+- `OpenAIStreamConverter::flush` emits a stream close that was deferred while waiting for usage, for streams that end without `data: [DONE]`. `chat_messages_stream` calls it once when the response body ends normally; code that drives the converter directly should do the same. It never fabricates a close for a stream that never delivered `finish_reason`, and it is not called after a read error or cancellation.
+
+### Fixed
+
+- OpenAI-line streaming usage is no longer dropped. With `stream_options.include_usage` the upstream sends the `finish_reason` chunk, then `{"choices":[],"usage":{...}}`, then `data: [DONE]`. `OpenAIStreamConverter` returned no events for chunks without choices, never read `usage`, and had already emitted `message_delta` (without usage) and `message_stop` on the `finish_reason` chunk, so no OpenAI-line stream from `chat_messages_stream` carried usage. The converter now records the usage object of any chunk, with or without choices (later chunks override earlier ones), and puts it in the `message_delta` immediately before the single `message_stop`.
+- Content blocks still close on the `finish_reason` chunk, but when no usage has been seen yet, `message_delta` and `message_stop` wait for the first of: a chunk carrying usage, `data: [DONE]`, or the end of the body. Only the first `finish_reason` counts. `data: [DONE]` without any `finish_reason` now closes open blocks and ends the message with `end_turn`. No path emits `message_stop` twice.
+- The streaming usage mapping matches the non-streaming one: `prompt_tokens` to `input_tokens`, `completion_tokens` to `output_tokens`. Cached and reasoning token details are neither mapped nor netted out. A count that is missing or not a JSON number is omitted rather than written as 0, and a stream that never carried a usage object has no `usage` key. Usage is read from the raw chunk, so a usage object that does not fit `OpenAIUsage` (for example one without `total_tokens`) no longer fails the chunk.
+- `OpenAIStreamChunk` deserialization accepts chunks without `id`, `object` or `choices`, such as gateway envelope and error-contract frames and usage-only chunks. These previously failed to deserialize and ended the stream with an error. Serialization is unchanged.
+- The OpenAI branch of `chat_messages_stream` now surfaces gateway `failed` / `error` events as `Error::Stream` through `parse_stream_error`, as `chat_stream_with_usage` already did, instead of passing them to the chunk converter.
+
+Streaming semantics now match `@acosmi/sdk-ts` 2.19.3 (gateway failure events on the OpenAI line) and 2.19.4 (usage tail chunk and `flush`) for these paths.
+
 ## [4.0.0] - 2026-09-05 — Custom-only dependency graph and strict token authority
 
 ### Breaking feature migration
