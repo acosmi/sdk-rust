@@ -100,7 +100,9 @@ pub struct OpenAIChatResponse {
     /// 把 `null` 解成 nil slice、`len(nil) == 0`）都容忍。2026-09-17 三份一并对齐到「容忍」：
     /// 消除异类就是这个立项存在的理由，留着它等于亲手制造一条新的三份分歧。
     ///
-    /// 宽容度到 `null` 为止：对象 / 标量形态的 `choices` 仍然报错，理由见 [`de_choices_or_empty`]。
+    /// 宽容度到 `null` 为止：对象 / 标量形态的 `choices` 仍然报错，理由见源码中 `de_choices_or_empty`
+    /// 的注释（该函数是私有的，这里刻意不写成 intra-doc 链接 —— 公开文档链到私有项会被
+    /// `rustdoc::private_intra_doc_links` 判错）。
     #[serde(default, deserialize_with = "de_choices_or_empty")]
     pub choices: Vec<OpenAIChatChoice>,
     /// 缺席**或显式 `null`** 时三个计数都落成 0。此前必填且非 null，不结算用量的兼容实现（以及被
@@ -231,7 +233,8 @@ pub struct OpenAIStreamChunk {
     /// "chat.completion.chunk"
     #[serde(default)]
     pub object: String,
-    /// 非数组形态（对象 / `null` / 标量）落成空 `Vec`，见 [`de_choices_lenient`]。
+    /// 非数组形态（对象 / `null` / 标量）落成空 `Vec`，见源码中 `de_choices_lenient` 的注释
+    /// （私有项，刻意不写成 intra-doc 链接，理由同上）。
     #[serde(default, deserialize_with = "de_choices_lenient")]
     pub choices: Vec<OpenAIStreamChoice>,
     /// 按 `stream_options.include_usage` 的帧序，非尾帧上为 null 或缺失，带值的是 `[DONE]` 之前的
