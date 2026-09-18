@@ -87,9 +87,10 @@ pub use crate::models::{
     EmbeddingUsage, GeoLoc, ImageGenerationRequest, ImageGenerationResponse, InputModality,
     ManagedModel, ModelCapabilities, MultimodalContent, OpenAIChatChoice, OpenAIChatMessage,
     OpenAIChatResponse, OpenAIFunctionCall, OpenAIStreamChoice, OpenAIStreamChunk,
-    OpenAIStreamConverter, OpenAIStreamDelta, OpenAIStreamToolCall, OpenAIToolCall, OpenAIUsage,
-    OutputConfig, ProviderFormat, QuotaSummary, RerankDocument, RerankQuery, RerankRequest,
-    RerankResponse, RerankResult, ServerTool, SourcesEvent, SourcesEventIssueCode,
+    OpenAIStreamConverter, OpenAIStreamDelta, OpenAIStreamToolCall, OpenAIStreamUsage,
+    OpenAIStreamUsageCompletionDetails, OpenAIStreamUsagePromptDetails, OpenAIToolCall,
+    OpenAIUsage, OutputConfig, ProviderFormat, QuotaSummary, RerankDocument, RerankQuery,
+    RerankRequest, RerankResponse, RerankResult, ServerTool, SourcesEvent, SourcesEventIssueCode,
     SourcesEventParseResult, StreamEvent, StreamSettlement, ThinkingConfig, VideoGenerationRequest,
     VideoTaskResponse, WebSearchConfig, WebSearchSource, MAX_END_USER_ID_LENGTH,
     SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
@@ -211,6 +212,6 @@ mod scaffold_tests {
 
     #[test]
     fn version_is_wired() {
-        assert_eq!(VERSION, "4.0.0");
+        assert_eq!(VERSION, "5.0.0");
     }
 }

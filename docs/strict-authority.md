@@ -12,6 +12,10 @@ For a caller-owned transport with no SDK reqwest, Hyper, TLS or WebSocket depend
 acosmi-sdk = { version = "=4.0.0", default-features = false, features = ["custom-transport", "sanitize", "desktop-loopback"] }
 ~~~
 
+> The feature contract above is unchanged in 5.0.0; pin `=5.0.0` for that release. 5.0.0 is major
+> only for the OpenAI-line wire DTO changes listed in the [CHANGELOG](../CHANGELOG.md), which do not
+> touch the authority or feature surface described here.
+
 The desktop-loopback feature is optional: it enables the SDK's local OAuth callback listener, not an outbound TLS/HTTP client. The custom-transport feature is a marker; HTTP transport interfaces and both model wire adapters are available even without it. Cargo features are additive: another dependency enabling native-http or notifications-ws on the same SDK will include those dependencies in the resolved graph. Inspect the application's final graph.
 
 Config.http and the legacy free functions accepting reqwest clients/errors require native-http. The transport-neutral iter_sse_lines_result / iter_sse_lines_result_with_cap / read_limited_result / read_limited_text_result helpers are available under every feature combination and accept SDK Result byte streams; their signatures do not change when features are unified. The Error::Http2 variant also requires native-http. WSConfig and Client::connect/disconnect require notifications-ws. Client::new/create without native-http return an explicit transport-required error; use a transport constructor. Multipart upload remains explicitly unsupported in custom mode.

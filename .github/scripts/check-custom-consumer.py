@@ -31,7 +31,7 @@ fn main()->acosmi::Result<()> {
     let mut token=TokenSet {access_token:"canary".into(),refresh_token:"canary".into(),expires_at:String::new(),scope:String::new(),client_id:String::new(),server_url:String::new()};
     zeroize::Zeroize::zeroize(&mut token);
     assert!(token.access_token.is_empty());
-    assert_eq!(acosmi::VERSION,"4.0.0");
+    assert_eq!(acosmi::VERSION,"5.0.0");
     Ok(())
 }
 """)

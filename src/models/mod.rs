@@ -36,8 +36,9 @@ pub use wire_anthropic::{
 // === OpenAI wire DTO（对齐 export * from './wire-openai'）===
 pub use wire_openai::{
     OpenAIChatChoice, OpenAIChatMessage, OpenAIChatResponse, OpenAIFunctionCall,
-    OpenAIStreamChoice, OpenAIStreamChunk, OpenAIStreamDelta, OpenAIStreamToolCall, OpenAIToolCall,
-    OpenAIUsage,
+    OpenAIStreamChoice, OpenAIStreamChunk, OpenAIStreamDelta, OpenAIStreamToolCall,
+    OpenAIStreamUsage, OpenAIStreamUsageCompletionDetails, OpenAIStreamUsagePromptDetails,
+    OpenAIToolCall, OpenAIUsage,
 };
 
 // === Model catalog helpers（v1.2+）===

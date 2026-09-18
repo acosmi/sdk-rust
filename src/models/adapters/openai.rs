@@ -9,7 +9,7 @@ use crate::models::types::{
     THINKING_HIGH, THINKING_MAX, THINKING_OFF,
 };
 use crate::models::wire_anthropic::{AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
-use crate::models::wire_openai::{OpenAIChatResponse, OpenAIStreamChunk};
+use crate::models::wire_openai::{OpenAIChatResponse, OpenAIStreamChunk, OpenAIStreamToolCall};
 use crate::shared::errors::{Error, Result};
 use serde_json::{json, Map, Number, Value};
 
@@ -61,7 +61,9 @@ pub fn build_request_body(_caps: &ModelCapabilities, req: &ChatRequest) -> Map<S
     if !eff.is_empty() {
         body.insert("reasoning_effort".to_string(), Value::String(eff));
     }
-    if _caps.supports_thinking && req.thinking.as_ref().and_then(|t| t.level.as_deref()) == Some(THINKING_OFF) {
+    if _caps.supports_thinking
+        && req.thinking.as_ref().and_then(|t| t.level.as_deref()) == Some(THINKING_OFF)
+    {
         body.insert("thinking".to_string(), json!({"type":"disabled"}));
     }
 
@@ -280,7 +282,8 @@ fn convert_openai_to_chat_response(oai: &OpenAIChatResponse) -> ChatResponse {
                 resp.content.push(ChatContentBlock {
                     r#type: "tool_use".to_string(),
                     id: Some(tc.id.clone()),
-                    name: Some(tc.function.name.clone()),
+                    // `name` 已是 `Option`：上游没给就不编一个空串出来（对齐 TS 的 `fn?.name`）。
+                    name: tc.function.name.clone(),
                     // OpenAI arguments 是 string，尝试解析为 JSON value（失败保留原串）。
                     input: Some(try_parse_json(&tc.function.arguments)),
                     ..Default::default()
@@ -354,7 +357,7 @@ pub fn parse_openai_response_to_anthropic(raw: &[u8]) -> Result<AnthropicRespons
                 resp.content.push(AnthropicContentBlock {
                     r#type: "tool_use".to_string(),
                     id: Some(tc.id.clone()),
-                    name: Some(tc.function.name.clone()),
+                    name: tc.function.name.clone(),
                     input: Some(try_parse_json(&tc.function.arguments)),
                     ..Default::default()
                 });
@@ -418,6 +421,18 @@ fn read_stream_usage(raw: Option<&Value>) -> Option<StreamMessageUsage> {
     })
 }
 
+/// 一条 tool_call delta 归属的块键（对应 TS `resolveToolKey` 的 `string | number` 键）。
+///
+/// 两个变体在语义上是两个不相交的命名空间：TS 用 `id:` 前缀让字符串键不可能撞上数字键，Rust 直接
+/// 用枚举表达同一件事。**不导出** —— 它是转换器的内部归并键，不是 wire 契约。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolKey {
+    /// 上游给了 `index`：规范形态，同一次工具调用的所有分片都带同一个 index。
+    Index(i64),
+    /// 上游省了 `index` 但给了非空 `id`。
+    Id(String),
+}
+
 /// 将 OpenAI SSE chunks 转换为 Anthropic 兼容的 [`StreamEvent`]。
 /// 有状态：跨 chunk 追踪 block 索引，以及为等待 usage 尾帧而推迟的收尾。
 ///
@@ -432,9 +447,16 @@ pub struct OpenAIStreamConverter {
     /// 不能用可能已被 text/tool 推进的 `block_index`（否则 content_block_stop 索引错配）。
     thinking_block_index: i64,
     text_started: bool,
-    /// OpenAI tool_call index → Anthropic block index。
+    /// OpenAI tool_call 键 → Anthropic block index。
     /// 用插入有序的 `Vec<(key, value)>` 复刻 JS `Map` 的迭代顺序（finish 时按插入序关闭 tool block）。
-    tool_block_index: Vec<(i64, i64)>,
+    tool_block_index: Vec<(ToolKey, i64)>,
+    /// 每个 tool block 已发出的 `partial_json` 累积，用于识别「每片重发全量参数」的上游
+    /// （对应 TS `toolArgsAccum`）。键必须与 [`Self::tool_block_index`] 取自**同一次**
+    /// [`Self::resolve_tool_key`] 调用，否则去重会挂在错误的 tool 上 —— 症状是「参数偶尔少一段」，
+    /// 比不修更难查。
+    tool_args_accum: Vec<(ToolKey, String)>,
+    /// 上一次解析出的 tool 键，供既缺 `index` 又缺 `id` 的后续增量沿用（对应 TS `lastToolKey`）。
+    last_tool_key: Option<ToolKey>,
     block_index: i64,
     /// 已发出 message_delta/message_stop（对应 TS `messageClosed`）：finish_reason、usage 尾帧、
     /// `[DONE]` 与 `flush` 共用它防重复收口——整条流恰好一个 message_stop。
@@ -444,7 +466,11 @@ pub struct OpenAIStreamConverter {
     blocks_closed: bool,
     /// finish_reason 已到、但 message_delta/message_stop 因等待 usage 尾帧而推迟时记下的 stop_reason
     /// （对应 TS `pendingStopReason`）；没有推迟中的收尾时为 `None`。
-    pending_stop_reason: Option<&'static str>,
+    ///
+    /// 类型是 `Option<String>` 而非 `Option<&'static str>`：未列出的 `finish_reason`
+    /// （`content_filter` / `function_call` …）要原样透传，`&'static str` 结构上装不下来自帧的动态串，
+    /// 于是只能压成 `end_turn` —— 把内容审查拦截伪装成正常结束。
+    pending_stop_reason: Option<String>,
     /// 最近一次带 usage 对象的帧搬出的 usage，后到覆盖先到（对应 TS `usage`）；整条流从未出现
     /// usage 对象时为 `None`，收尾 message_delta 据此不写 usage 键。
     usage: Option<StreamMessageUsage>,
@@ -454,6 +480,50 @@ impl OpenAIStreamConverter {
     /// 新建转换器。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 解析一条 tool_call delta 归属的块键（对应 TS `resolveToolKey`）。
+    ///
+    /// OpenAI 流式规范里 `index` 必填，但兼容实现常省略。此前键直接是 `tc.index: i64`：两个都省略
+    /// index 的 tool_call 会共用键 `0`，于是只开一个块、两段参数拼进同一条 `partial_json` 流，产出
+    /// `{…}{…}` 这种必然非法的 JSON，第二个调用的 id / name 彻底丢失。
+    ///
+    /// 三级降级让至少一种稳定标识生效：`index` → `id:<id>` → 沿用上一个键；三者皆无时落 `Index(0)`
+    /// 并记为「上一个键」，于是同一串无标识的续片至少归到同一个块上。
+    fn resolve_tool_key(&mut self, tc: &OpenAIStreamToolCall) -> ToolKey {
+        if let Some(index) = tc.index {
+            let key = ToolKey::Index(index);
+            self.last_tool_key = Some(key.clone());
+            return key;
+        }
+        if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
+            let key = ToolKey::Id(id.to_string());
+            self.last_tool_key = Some(key.clone());
+            return key;
+        }
+        if let Some(key) = &self.last_tool_key {
+            return key.clone();
+        }
+        let key = ToolKey::Index(0);
+        self.last_tool_key = Some(key.clone());
+        key
+    }
+
+    /// 取某个 tool 键上已累积的 `partial_json`；没发过则为空串（对应 TS `?? ''`）。
+    fn tool_args_accum_of(&self, key: &ToolKey) -> String {
+        self.tool_args_accum
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// 写回某个 tool 键上的累积值，保持插入序（对应 TS `Map::set`）。
+    fn set_tool_args_accum(&mut self, key: &ToolKey, value: String) {
+        match self.tool_args_accum.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value,
+            None => self.tool_args_accum.push((key.clone(), value)),
+        }
     }
 
     /// 关闭仍打开的 text / thinking / tool 块，整条流只关一次（对应 TS `closeContentBlocks`）。
@@ -528,10 +598,10 @@ impl OpenAIStreamConverter {
             // 上游可能在 `[DONE]` 之前不发 finish_reason（部分兼容实现、被中断的流）。此前这里直接
             // 返回空事件，已打开的块永不闭合，下游也收不到 message_stop。
             let mut events: Vec<StreamEvent> = Vec::new();
-            if let Some(stop_reason) = self.pending_stop_reason {
+            if let Some(stop_reason) = self.pending_stop_reason.clone() {
                 // finish_reason 已到而 usage 尾帧始终没来：流已声明结束，推迟的收尾不能再等
                 // （块已在 finish_reason 帧上关过）。
-                self.emit_message_end(&mut events, stop_reason);
+                self.emit_message_end(&mut events, &stop_reason);
             } else if self.message_started {
                 self.close_content_blocks(&mut events);
                 self.emit_message_end(&mut events, "end_turn");
@@ -565,8 +635,8 @@ impl OpenAIStreamConverter {
                 // 没有 choices 的 data 帧（网关错误契约帧、usage 尾帧）不产出内容事件：带 usage 且有
                 // 推迟中的收尾时在这里补发，不带 usage 的零事件。
                 if frame_carries_usage {
-                    if let Some(stop_reason) = self.pending_stop_reason {
-                        self.emit_message_end(&mut events, stop_reason);
+                    if let Some(stop_reason) = self.pending_stop_reason.clone() {
+                        self.emit_message_end(&mut events, &stop_reason);
                     }
                 }
                 return Ok((events, false));
@@ -594,6 +664,20 @@ impl OpenAIStreamConverter {
         if let Some(rc) = choice.delta.reasoning_content.as_deref() {
             if !rc.is_empty() {
                 if !self.thinking_started {
+                    // 关闭仍打开的 text block（镜像 tool_calls 分支）：chunk 顺序 content →
+                    // reasoning_content 时 text 仍开着且 block_index 未推进，若不在此关闭并递增，
+                    // thinking block 会与 text 撞 index 0 —— 两个 content_block_start 落在同一个
+                    // index 上，且收尾时 `close_content_blocks` 走 text 分支，thinking 块永不闭合。
+                    if self.text_started {
+                        let stop_json = json!({
+                            "type": "content_block_stop",
+                            "index": self.block_index,
+                        })
+                        .to_string();
+                        events.push(ev("content_block_stop", stop_json));
+                        self.block_index += 1;
+                        self.text_started = false;
+                    }
                     self.thinking_started = true;
                     self.thinking_block_index = self.block_index; // 记下 thinking 占用的 index
                     let block_json = json!({
@@ -651,7 +735,10 @@ impl OpenAIStreamConverter {
         // tool_calls delta。
         if let Some(tcs) = &choice.delta.tool_calls {
             for tc in tcs {
-                if !self.tool_block_index.iter().any(|(k, _)| *k == tc.index) {
+                // 归并键只解析**一次**：建块、去重累积、查块三处必须是同一个值，
+                // 否则去重会挂在与块不同的 tool 上。
+                let tool_key = self.resolve_tool_key(tc);
+                if !self.tool_block_index.iter().any(|(k, _)| *k == tool_key) {
                     // 关闭仍打开的 thinking block（镜像 text 分支）。用 thinking_block_index 关。
                     if self.thinking_started && !self.thinking_stopped {
                         self.thinking_stopped = true;
@@ -674,38 +761,71 @@ impl OpenAIStreamConverter {
                         self.block_index += 1;
                         self.text_started = false;
                     }
-                    self.tool_block_index.push((tc.index, self.block_index));
+                    self.tool_block_index
+                        .push((tool_key.clone(), self.block_index));
+                    // `content_block` 按键条件插入，不用 `json!` 字面量：`json!({"name": opt})` 在
+                    // `opt == None` 时写出 `"name": null` 而**不是**省略该键，与 TS
+                    // `JSON.stringify` 对 `undefined` 的行为不同。上游没给 id / name 时写空串或
+                    // `null` 都是在替它发明一个值 —— 下游按「有这个键」判有效就会收到空 id。
+                    let mut content_block = Map::new();
+                    content_block.insert("type".to_string(), Value::String("tool_use".to_string()));
+                    if let Some(id) = &tc.id {
+                        content_block.insert("id".to_string(), Value::String(id.clone()));
+                    }
+                    if let Some(name) = &tc.function.name {
+                        content_block.insert("name".to_string(), Value::String(name.clone()));
+                    }
+                    content_block.insert("input".to_string(), Value::Object(Map::new()));
                     let block_json = json!({
                         "type": "content_block_start",
                         "index": self.block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc.id.clone().unwrap_or_default(),
-                            "name": tc.function.name,
-                            "input": {},
-                        },
+                        "content_block": content_block,
                     })
                     .to_string();
                     events.push(ev("content_block_start", block_json));
                     self.block_index += 1; // 递增，为下一个 tool_call block 预留索引
                 }
-                if !tc.function.arguments.is_empty() {
-                    let idx = self
-                        .tool_block_index
-                        .iter()
-                        .find(|(k, _)| *k == tc.index)
-                        .map(|(_, v)| *v)
-                        .unwrap();
-                    let delta_json = json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": tc.function.arguments,
-                        },
-                    })
-                    .to_string();
-                    events.push(ev("content_block_delta", delta_json));
+                let raw_args = tc.function.arguments.as_str();
+                if !raw_args.is_empty() {
+                    // 累计 vs 增量判别（对应 TS `toolArgsAccum`）：部分上游每个 chunk 重发**全量**
+                    // 参数而非增量。此前无条件原样发，下游 `input += partial_json` 拼出
+                    // `{"a":{"a":1{"a":1}` 这种必然非法的 JSON。判据取最保守的一种：新片严格以已
+                    // 累积内容为前缀**且**更长时，才认为上游在重发全量，只发差值。真增量流里某一
+                    // 片恰好等于「此前全部内容的延长」概率可忽略。
+                    let accum = self.tool_args_accum_of(&tool_key);
+                    let emit = if !accum.is_empty()
+                        && raw_args.len() > accum.len()
+                        && raw_args.starts_with(&accum)
+                    {
+                        // `starts_with` 成立 ⇒ `accum.len()` 落在字符边界上，切片安全。
+                        let diff = raw_args[accum.len()..].to_string();
+                        self.set_tool_args_accum(&tool_key, raw_args.to_string());
+                        diff
+                    } else {
+                        self.set_tool_args_accum(&tool_key, format!("{accum}{raw_args}"));
+                        raw_args.to_string()
+                    };
+                    if !emit.is_empty() {
+                        // 键与上面建块用的是同一个 `tool_key`：块必已建好，查不到只可能是逻辑被改坏，
+                        // 此时宁可不发 delta 也不 panic。
+                        if let Some(idx) = self
+                            .tool_block_index
+                            .iter()
+                            .find(|(k, _)| *k == tool_key)
+                            .map(|(_, v)| *v)
+                        {
+                            let delta_json = json!({
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": emit,
+                                },
+                            })
+                            .to_string();
+                            events.push(ev("content_block_delta", delta_json));
+                        }
+                    }
                 }
             }
         }
@@ -713,11 +833,14 @@ impl OpenAIStreamConverter {
         // finish_reason：关闭所有 block；message_delta + message_stop 视 usage 是否已到，立即发或推迟。
         let finish = choice.finish_reason.as_deref().unwrap_or("");
         if !finish.is_empty() {
-            // stop_reason 映射。
+            // stop_reason 映射。`content_filter` / `function_call` 等未列出的值刻意原样透传而不是
+            // 压成 `end_turn` —— 把内容审查拦截伪装成正常结束会让下游无从分辨。同文件非流式路径的
+            // `map_finish_reason` 一直是原样透传，这里跟它、也跟 TS 的 `switch` 默认臂对齐。
             let stop_reason = match finish {
                 "tool_calls" => "tool_use",
                 "length" => "max_tokens",
-                _ => "end_turn",
+                "stop" => "end_turn",
+                other => other,
             };
             // 只认第一个 finish_reason：收尾已发出或已推迟时，后到的 finish_reason 既不改写
             // stop_reason，也不再关块。
@@ -730,15 +853,15 @@ impl OpenAIStreamConverter {
                     // `include_usage` 的标准帧序里 finish_reason 帧先于 usage 尾帧。此刻收尾，
                     // message_delta 只能不带 usage，之后到的 usage 已无处安放——于是推迟到 usage 帧 /
                     // `[DONE]` / EOF（`flush`）三者先到者。块照常在这一帧关闭。
-                    self.pending_stop_reason = Some(stop_reason);
+                    self.pending_stop_reason = Some(stop_reason.to_string());
                 }
             }
         }
 
         // 推迟收尾期间到达的带 choices 帧若携带 usage，同样立即补发。
         if frame_carries_usage {
-            if let Some(stop_reason) = self.pending_stop_reason {
-                self.emit_message_end(&mut events, stop_reason);
+            if let Some(stop_reason) = self.pending_stop_reason.clone() {
+                self.emit_message_end(&mut events, &stop_reason);
             }
         }
 
@@ -755,8 +878,8 @@ impl OpenAIStreamConverter {
     /// 调用本方法。
     pub fn flush(&mut self) -> Vec<StreamEvent> {
         let mut events: Vec<StreamEvent> = Vec::new();
-        if let Some(stop_reason) = self.pending_stop_reason {
-            self.emit_message_end(&mut events, stop_reason);
+        if let Some(stop_reason) = self.pending_stop_reason.clone() {
+            self.emit_message_end(&mut events, &stop_reason);
         }
         events
     }
@@ -1423,5 +1546,640 @@ mod tests {
         assert_blocks_well_formed(&all);
         let delta = expect_single_close_at_end(&all);
         assert_eq!(delta["delta"], json!({ "stop_reason": "tool_use" }));
+    }
+
+    // ---- OpenAI 规范工具调用流：续片缺 name / 缺 function、arguments 非串、上游重发全量 ----
+    // 参照 TS `models/adapters/openai.ts` 的 tool_calls 分支（`fn?.name` / `fn?.arguments` /
+    // `JSON.stringify(fn.arguments)` / `toolArgsAccum`）。
+
+    /// 工具调用**首片**：带 id + name，`arguments` 为空串 —— OpenAI 规范形态。
+    fn tool_first_chunk(index: i64, id: &str, name: &str) -> String {
+        json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": "" },
+                }] },
+                "finish_reason": null,
+            }],
+        })
+        .to_string()
+    }
+
+    /// 工具调用**续片**：只有 `index` 与 `arguments` 分片，**没有** `id` / `type` / `name`
+    /// —— 这正是 OpenAI 规范里每一次工具调用从第二帧起的形态。
+    fn tool_arg_chunk(index: i64, args: Value) -> String {
+        json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{ "index": index, "function": { "arguments": args } }] },
+                "finish_reason": null,
+            }],
+        })
+        .to_string()
+    }
+
+    /// 空心续片：tool_call 上只有 `index`，连 `function` 都没有。
+    fn tool_hollow_chunk(index: i64) -> String {
+        json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{ "index": index }] },
+                "finish_reason": null,
+            }],
+        })
+        .to_string()
+    }
+
+    /// 另一种空心续片：有 `function` 但里面只有 `name`，没有 `arguments`。
+    fn tool_name_only_chunk(index: i64, name: &str) -> String {
+        json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{ "index": index, "function": { "name": name } }] },
+                "finish_reason": null,
+            }],
+        })
+        .to_string()
+    }
+
+    /// 逐帧喂入，保留每帧各自的 `Result` —— 「零错误」这类断言要点名错误原文，不能靠 `unwrap` 的
+    /// panic 代劳。返回 `(每帧结果, 全部成功帧的事件)`。
+    #[allow(clippy::type_complexity)]
+    fn feed_results(frames: &[&str]) -> (Vec<std::result::Result<Parsed, String>>, Parsed) {
+        let mut conv = new_openai_stream_converter();
+        let mut steps = Vec::new();
+        let mut all = Vec::new();
+        for frame in frames {
+            match conv.convert(frame) {
+                Ok((events, _)) => {
+                    let parsed = parse_events(&events);
+                    all.extend(parsed.clone());
+                    steps.push(Ok(parsed));
+                }
+                Err(e) => steps.push(Err(e.to_string())),
+            }
+        }
+        (steps, all)
+    }
+
+    fn step_errors(steps: &[std::result::Result<Parsed, String>]) -> Vec<&String> {
+        steps.iter().filter_map(|s| s.as_ref().err()).collect()
+    }
+
+    /// 按发出顺序取出全部 `input_json_delta` 的 `partial_json`。
+    fn partial_json_pieces(events: &Parsed) -> Vec<String> {
+        events
+            .iter()
+            .filter(|(name, payload)| {
+                name == "content_block_delta" && payload["delta"]["type"] == "input_json_delta"
+            })
+            .map(|(_, payload)| {
+                payload["delta"]["partial_json"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn openai_spec_toolcall_continuation_frames_carry_no_name() {
+        let (steps, all) = feed_results(&[
+            &tool_first_chunk(0, "call_1", "get_weather"),
+            &tool_arg_chunk(0, json!(r#"{"city":"#)),
+            &tool_arg_chunk(0, json!(r#" "SF"}"#)),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        // 承重：参数一字节不落地拼回来。
+        assert_eq!(partial_json_pieces(&all).concat(), r#"{"city": "SF"}"#);
+        // 续片没有 name，也不能被当成第二个工具调用而另开一个块。
+        let by_type = assert_blocks_well_formed(&all);
+        assert_eq!(by_type["tool_use"], [0]);
+        assert_eq!(count_events(&all, "message_stop"), 1);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "tool_use" }));
+    }
+
+    #[test]
+    fn toolcall_delta_without_function_emits_no_delta() {
+        let (steps, all) = feed_results(&[
+            &tool_first_chunk(0, "call_1", "get_weather"),
+            &tool_hollow_chunk(0),
+            &tool_name_only_chunk(0, "get_weather"),
+            &tool_arg_chunk(0, json!("{}")),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        // 两种空心帧自己都零事件：既不另开块，也不发 delta。
+        assert_eq!(steps[1].as_ref().map(|p| event_names(p)), Ok(Vec::new()));
+        assert_eq!(steps[2].as_ref().map(|p| event_names(p)), Ok(Vec::new()));
+        // 正向对照：它们后面的真参数片照常送达，证明空心帧没把转换器弄坏。
+        assert_eq!(partial_json_pieces(&all), ["{}"]);
+        assert_eq!(assert_blocks_well_formed(&all)["tool_use"], [0]);
+    }
+
+    #[test]
+    fn choice_without_index_is_not_a_stream_error() {
+        // 兼容实现常省略 choice 上的 `index`；转换器从不读它（只取 `choices[0]`）。此前必填，
+        // 这类帧以 `missing field \`index\`` 终止整条流。
+        let no_index = r#"{"id":"c1","choices":[{"delta":{"content":"hi"}}]}"#;
+        let (steps, all) = feed_results(&[no_index, &finish_chunk("stop", None), "[DONE]"]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        // 正向对照：正文照常送达、块照常配对，证明「没报错」不是靠把整帧丢掉换来的。
+        let texts: Vec<&str> = all
+            .iter()
+            .filter(|(name, p)| name == "content_block_delta" && p["delta"]["type"] == "text_delta")
+            .map(|(_, p)| p["delta"]["text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(texts, ["hi"]);
+        assert_eq!(assert_blocks_well_formed(&all)["text"], [0]);
+    }
+
+    #[test]
+    fn toolcall_arguments_object_is_stringified_not_rejected() {
+        let (steps, all) = feed_results(&[
+            &tool_first_chunk(0, "call_1", "get_weather"),
+            &tool_arg_chunk(0, json!({ "city": "sf" })),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let joined = partial_json_pieces(&all).concat();
+        assert!(!joined.contains("[object Object]"), "{joined}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&joined).unwrap(),
+            json!({ "city": "sf" })
+        );
+    }
+
+    #[test]
+    fn full_args_resend_upstream_yields_one_valid_json() {
+        // 每片重发全量而非增量的上游。
+        let (steps, all) = feed_results(&[
+            &tool_first_chunk(0, "call_1", "f"),
+            &tool_arg_chunk(0, json!(r#"{"a":"#)),
+            &tool_arg_chunk(0, json!(r#"{"a":1"#)),
+            &tool_arg_chunk(0, json!(r#"{"a":1}"#)),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let joined = partial_json_pieces(&all).concat();
+        assert_eq!(joined, r#"{"a":1}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&joined).unwrap(),
+            json!({ "a": 1 })
+        );
+    }
+
+    #[test]
+    fn true_incremental_args_are_still_forwarded_piece_by_piece() {
+        // 正向对照：真增量流。第二片**比已累积内容更长**却不是它的延长 —— 只有「严格前缀且更长」
+        // 这一档判据能同时放过它和上一条用例的重发流；放宽成「只要更长就只发差值」会从这里吃掉
+        // 开头的若干字节。
+        let (steps, all) = feed_results(&[
+            &tool_first_chunk(0, "call_1", "f"),
+            &tool_arg_chunk(0, json!(r#"{"city":"#)),
+            &tool_arg_chunk(0, json!(r#""san francisco"}"#)),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let pieces = partial_json_pieces(&all);
+        assert_eq!(pieces, [r#"{"city":"#, r#""san francisco"}"#]);
+        let joined = pieces.concat();
+        assert_eq!(joined, r#"{"city":"san francisco"}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&joined).unwrap(),
+            json!({ "city": "san francisco" })
+        );
+    }
+
+    // ---- 归并键三级降级 / id·name 键省略 / text 在前时的 thinking 块 / 缺 delta 的 choice ----
+    // 参照 TS `models/adapters/openai.ts` 的 `resolveToolKey` 与 `content_block: { id: tc.id,
+    // name: fn?.name }`（`JSON.stringify` 对 `undefined` 省略该键）。
+
+    /// 不带 `index` 的 tool_call：只有 `id` + `function`（兼容实现的形态）。
+    fn tool_call_chunk_without_index(id: &str, name: &str, args: &str) -> String {
+        json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args },
+                }] },
+            }],
+        })
+        .to_string()
+    }
+
+    /// 既无 `index` 也无 `id` 的续片：只能靠沿用上一个键归位。
+    fn tool_arg_chunk_anonymous(args: &str) -> String {
+        json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{ "function": { "arguments": args } }] },
+            }],
+        })
+        .to_string()
+    }
+
+    /// 带 `index` 但既无 `id` 也无 `name` 的 tool_call。
+    fn tool_call_chunk_index_only(index: i64, args: &str) -> String {
+        json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [{ "index": index, "function": { "arguments": args } }] },
+            }],
+        })
+        .to_string()
+    }
+
+    /// 按发出顺序取出每个 `tool_use` 块的 `content_block` 对象。
+    fn tool_use_content_blocks(events: &Parsed) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|(name, p)| {
+                name == "content_block_start" && p["content_block"]["type"] == "tool_use"
+            })
+            .map(|(_, p)| p["content_block"].clone())
+            .collect()
+    }
+
+    /// 按块 index 归并 `input_json_delta`，返回 (index, 拼接后的参数)，按块首次出现的顺序。
+    fn partial_json_by_block(events: &Parsed) -> Vec<(i64, String)> {
+        let mut out: Vec<(i64, String)> = Vec::new();
+        for (name, payload) in events {
+            if name != "content_block_delta" || payload["delta"]["type"] != "input_json_delta" {
+                continue;
+            }
+            let index = payload["index"].as_i64().unwrap_or(-1);
+            let piece = payload["delta"]["partial_json"]
+                .as_str()
+                .unwrap_or_default();
+            match out.iter_mut().find(|(i, _)| *i == index) {
+                Some(slot) => slot.1.push_str(piece),
+                None => out.push((index, piece.to_string())),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn two_index_less_toolcalls_do_not_share_a_block() {
+        // 承重：两个都省略 `index` 的 tool_call。此前键是 `i64`，缺席落 0 ⇒ 共用一个块、两段参数
+        // 拼成 `{"x":1}{"y":2}` 这种必然非法的 JSON，第二个调用的 id / name 彻底丢失。
+        let (steps, all) = feed_results(&[
+            &tool_call_chunk_without_index("call_1", "a", r#"{"x":1}"#),
+            &tool_call_chunk_without_index("call_2", "b", r#"{"y":2}"#),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let by_type = assert_blocks_well_formed(&all);
+        assert_eq!(by_type["tool_use"], [0, 1]);
+        // 每块的参数各自是一段合法 JSON，没有被拼进同一条流。
+        let args = partial_json_by_block(&all);
+        assert_eq!(
+            args,
+            [(0, r#"{"x":1}"#.to_string()), (1, r#"{"y":2}"#.to_string())]
+        );
+        for (_, piece) in &args {
+            serde_json::from_str::<Value>(piece).expect("每块参数必须各自合法");
+        }
+        // 两个调用的身份都还在。
+        let blocks = tool_use_content_blocks(&all);
+        assert_eq!(blocks[0]["id"], json!("call_1"));
+        assert_eq!(blocks[0]["name"], json!("a"));
+        assert_eq!(blocks[1]["id"], json!("call_2"));
+        assert_eq!(blocks[1]["name"], json!("b"));
+    }
+
+    /// 正向对照，**独立用例**：带 `index` 时同样是两个块 —— 证明上一条钉的是「缺 index 也能分开」，
+    /// 而不是「随便什么都分开」。把 `resolve_tool_key` 的 `id:` 降级删掉时这条必须仍绿。
+    #[test]
+    fn two_indexed_toolcalls_still_take_their_own_blocks() {
+        let (steps, all) = feed_results(&[
+            &tool_call_chunk(0, "call_1", "a", r#"{"x":1}"#),
+            &tool_call_chunk(1, "call_2", "b", r#"{"y":2}"#),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        assert_eq!(assert_blocks_well_formed(&all)["tool_use"], [0, 1]);
+        assert_eq!(
+            partial_json_by_block(&all),
+            [(0, r#"{"x":1}"#.to_string()), (1, r#"{"y":2}"#.to_string())]
+        );
+    }
+
+    #[test]
+    fn anonymous_continuation_fragments_stay_on_the_last_tool_key() {
+        // 三级降级的最后一级：续片既无 `index` 也无 `id`，只能沿用上一个键。另开一个块会让参数
+        // 劈成两半，两半各自都不是合法 JSON。
+        let (steps, all) = feed_results(&[
+            &tool_call_chunk_without_index("call_1", "f", r#"{"a":"#),
+            &tool_arg_chunk_anonymous("1}"),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        assert_eq!(assert_blocks_well_formed(&all)["tool_use"], [0]);
+        assert_eq!(partial_json_by_block(&all), [(0, r#"{"a":1}"#.to_string())]);
+    }
+
+    #[test]
+    fn missing_id_and_name_keys_are_omitted_not_empty_strings() {
+        // 承重：上游没给 id / name 时不能替它发明一个空串 —— 下游按「有 id 键」判有效会收到 `""`。
+        let (steps, all) = feed_results(&[
+            &tool_call_chunk_index_only(0, r#"{"a":1}"#),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let blocks = tool_use_content_blocks(&all);
+        assert_eq!(blocks.len(), 1);
+        let block = blocks[0].as_object().expect("content_block 是对象");
+        assert!(!block.contains_key("id"), "{block:?}");
+        assert!(!block.contains_key("name"), "{block:?}");
+        // 其余键照常在，`null` 也不许冒充「省略」。
+        assert_eq!(block["type"], json!("tool_use"));
+        assert_eq!(block["input"], json!({}));
+        assert!(!block.values().any(Value::is_null), "{block:?}");
+    }
+
+    /// 正向对照，**独立用例**：给了 id / name 时两个键都必须在、值正确 —— 证明上一条钉的是
+    /// 「缺席才省略」，不是「这两个键从来就没写过」。
+    #[test]
+    fn present_id_and_name_keys_are_written_through() {
+        let (steps, all) = feed_results(&[
+            &tool_first_chunk(0, "call_1", "get_weather"),
+            &finish_chunk("tool_calls", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let blocks = tool_use_content_blocks(&all);
+        assert_eq!(blocks[0]["id"], json!("call_1"));
+        assert_eq!(blocks[0]["name"], json!("get_weather"));
+    }
+
+    #[test]
+    fn text_then_thinking_do_not_share_an_index() {
+        // 承重（三份 SDK 共有缺陷）：上游先发正文再发 reasoning_content 时，thinking 分支不关
+        // 已打开的 text 块、也不推进 block_index ⇒ 两个 content_block_start 都落在 index 0，
+        // 且收尾 `close_content_blocks` 走 text 分支，thinking 块永不闭合。
+        let events = run_chunks(&[
+            &content_chunk("hello"),
+            &thinking_chunk("thinking"),
+            &finish_chunk("stop", None),
+        ]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["text"], [0]);
+        assert_eq!(by_type["thinking"], [1]);
+        // thinking 的 delta 必须指向它自己那个块。
+        let thinking_delta_index = events
+            .iter()
+            .find(|(name, p)| {
+                name == "content_block_delta" && p["delta"]["type"] == "thinking_delta"
+            })
+            .map(|(_, p)| p["index"].as_i64().unwrap_or(-1));
+        assert_eq!(thinking_delta_index, Some(1));
+    }
+
+    /// 正向对照，**独立用例**：thinking 在前、正文在后的既有顺序一字不变 —— 证明上一条钉的是
+    /// 「反序也要各占一个 index」，而不是把块顺序整个改了。撤回 C-3 修复时这条必须仍绿。
+    #[test]
+    fn thinking_then_text_order_is_unchanged() {
+        let events = run_chunks(&[
+            &thinking_chunk("thinking"),
+            &content_chunk("hello"),
+            &finish_chunk("stop", None),
+        ]);
+        let by_type = assert_blocks_well_formed(&events);
+        assert_eq!(by_type["thinking"], [0]);
+        assert_eq!(by_type["text"], [1]);
+    }
+
+    #[test]
+    fn choice_without_delta_is_not_a_stream_error() {
+        // 承重（三份 SDK 共有缺陷）：`delta` 此前必填，缺它的帧以 `missing field \`delta\`` 终止
+        // 整条流。TS 在 `choice.delta.reasoning_content` 处同样炸，Go 反而给零值 —— 三份一并对齐。
+        let bare_choice = r#"{"id":"c1","choices":[{"index":0}]}"#;
+        let finish_without_delta = r#"{"id":"c1","choices":[{"index":0,"finish_reason":"stop"}]}"#;
+        let (steps, all) = feed_results(&[
+            &content_chunk("hi"),
+            bare_choice,
+            finish_without_delta,
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        // 缺 delta 的空 choice 零事件；带 finish_reason 的那帧照常关块并收口。
+        assert_eq!(steps[1].as_ref().map(|p| event_names(p)), Ok(Vec::new()));
+        assert_blocks_well_formed(&all);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "end_turn" }));
+    }
+
+    /// 正向对照，**独立用例**：delta 在场时正文照常送达 —— 证明上一条钉的是「缺 delta 不报错」，
+    /// 不是「delta 整个不看了」。
+    #[test]
+    fn choice_with_delta_still_emits_its_content() {
+        let (steps, all) = feed_results(&[
+            &content_chunk("hi"),
+            &content_chunk(" there"),
+            &finish_chunk("stop", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        let texts: Vec<&str> = all
+            .iter()
+            .filter(|(name, p)| name == "content_block_delta" && p["delta"]["type"] == "text_delta")
+            .map(|(_, p)| p["delta"]["text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(texts, ["hi", " there"]);
+    }
+
+    /// 喂「正文 + 该 finish_reason + `[DONE]`」，取收尾 message_delta 上的 stop_reason。
+    fn stop_reason_for(reason: &str) -> String {
+        let (steps, all) =
+            feed_results(&[&content_chunk("hi"), &finish_chunk(reason, None), "[DONE]"]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        expect_single_close_at_end(&all)["delta"]["stop_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn unlisted_finish_reason_is_passed_through() {
+        // 承重：未列出的值原样透传，绝不压成 end_turn —— 把内容审查拦截伪装成正常结束会让下游
+        // 无从分辨。
+        assert_eq!(stop_reason_for("content_filter"), "content_filter");
+        assert_eq!(stop_reason_for("function_call"), "function_call");
+    }
+
+    /// 负向对照，与上一条**分开一个用例**：默认臂被改回 `_ => "end_turn"` 时这条必须仍然绿 ——
+    /// 它证明上一条钉的是「透传」，不是「随便什么都过」。
+    #[test]
+    fn listed_finish_reasons_still_map_to_anthropic_stop_reasons() {
+        assert_eq!(stop_reason_for("stop"), "end_turn");
+        assert_eq!(stop_reason_for("tool_calls"), "tool_use");
+        assert_eq!(stop_reason_for("length"), "max_tokens");
+    }
+
+    #[test]
+    fn non_array_choices_yields_zero_events_not_a_stream_error() {
+        // 病态上游 / 网关异形帧：`choices` 是对象而不是数组。
+        let bogus = r#"{"id":"c1","choices":{"0":{"index":0,"delta":{"content":"x"}}}}"#;
+        let (steps, all) = feed_results(&[
+            &content_chunk("hi"),
+            bogus,
+            &finish_chunk("stop", None),
+            "[DONE]",
+        ]);
+        assert!(step_errors(&steps).is_empty(), "{:?}", step_errors(&steps));
+        assert_eq!(steps[1].as_ref().map(|p| event_names(p)), Ok(Vec::new()));
+        // 正向对照：这一帧之后的正常帧照常处理，流照常收口 —— 转换器没被它弄坏。
+        assert_blocks_well_formed(&all);
+        let delta = expect_single_close_at_end(&all);
+        assert_eq!(delta["delta"], json!({ "stop_reason": "end_turn" }));
+    }
+
+    // ---- 非流式：`content` 为 null / 缺席、`finish_reason` 为 null ----
+    // 参照 TS 同文件的 `if (choice.message.content && choice.message.content !== '')` 与
+    // `switch (choice.finish_reason) { … default: resp.stop_reason = choice.finish_reason }`。
+
+    /// 只有工具调用的非流式回包，`content` 按 OpenAI 规范为 `null`。
+    const TOOLCALL_RESPONSE_CONTENT_NULL: &[u8] = br#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+
+    /// 同上，但 `content` 键整个缺席。
+    const TOOLCALL_RESPONSE_CONTENT_ABSENT: &[u8] = br#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+
+    /// 正向对照：同一形态但带非空正文。（字面量是 raw **byte** string，只能写 ASCII。）
+    const TOOLCALL_RESPONSE_WITH_TEXT: &[u8] = br#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"let me check","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+
+    fn block_types(resp: &ChatResponse) -> Vec<&str> {
+        resp.content.iter().map(|b| b.r#type.as_str()).collect()
+    }
+
+    #[test]
+    fn null_content_with_tool_calls_yields_tool_use_and_no_empty_text_block() {
+        let resp = parse_response(TOOLCALL_RESPONSE_CONTENT_NULL).unwrap();
+        // 承重：`"content": null` 是 OpenAI 规范对「只有工具调用」的标准形态，不是解码失败。
+        assert_eq!(block_types(&resp), ["tool_use"]);
+        assert_eq!(resp.content[0].id.as_deref(), Some("call_1"));
+        assert_eq!(resp.content[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(resp.content[0].input, Some(json!({ "city": "SF" })));
+        assert_eq!(resp.stop_reason, "tool_use");
+
+        // 同一形态在 chatMessagesOpenAI 那条路径上也不能失败。
+        let anthropic = parse_openai_response_to_anthropic(TOOLCALL_RESPONSE_CONTENT_NULL).unwrap();
+        assert_eq!(
+            anthropic
+                .content
+                .iter()
+                .map(|b| b.r#type.as_str())
+                .collect::<Vec<_>>(),
+            ["tool_use"]
+        );
+
+        // 正向对照：正文非空时 text 块必须在，证明断言钉的是「空内容不产块」而不是「从不产块」。
+        let with_text = parse_response(TOOLCALL_RESPONSE_WITH_TEXT).unwrap();
+        assert_eq!(block_types(&with_text), ["text", "tool_use"]);
+        assert_eq!(with_text.content[0].text.as_deref(), Some("let me check"));
+    }
+
+    #[test]
+    fn absent_content_key_is_decoded_like_an_empty_one() {
+        let resp = parse_response(TOOLCALL_RESPONSE_CONTENT_ABSENT).unwrap();
+        assert_eq!(block_types(&resp), ["tool_use"]);
+        assert_eq!(resp.content[0].name.as_deref(), Some("get_weather"));
+        let anthropic =
+            parse_openai_response_to_anthropic(TOOLCALL_RESPONSE_CONTENT_ABSENT).unwrap();
+        assert_eq!(anthropic.content.len(), 1);
+    }
+
+    /// C-4：缺 `choices` 的非流式回包，两个公开入口都必须解得动并给零内容块。实测此前两者与直接
+    /// `from_str` 一起报 `missing field \`choices\`` —— 其余字段再完整，调用方一个字节也拿不到。
+    #[test]
+    fn missing_choices_response_yields_zero_blocks_not_a_decode_error() {
+        let no_choices = br#"{"id":"c1","object":"chat.completion","model":"m","usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#;
+        let resp = parse_response(no_choices).expect("missing choices must not fail the response");
+        assert!(block_types(&resp).is_empty());
+        // 其余字段照常转换：id / model / usage 不因为没有 choices 就一起丢掉。
+        assert_eq!(resp.id, "c1");
+        assert_eq!(resp.model, "m");
+        assert_eq!(resp.usage.input_tokens, 3);
+        assert_eq!(resp.usage.output_tokens, 5);
+        // 没有 choice 就没有 finish_reason，空串即「没有」，绝不伪造一个 `end_turn`。
+        assert_eq!(resp.stop_reason, "");
+
+        // 同一形态在 chatMessagesOpenAI 那条路径上也不能失败。
+        let anthropic = parse_openai_response_to_anthropic(no_choices)
+            .expect("missing choices must not fail the anthropic projection");
+        assert!(anthropic.content.is_empty());
+        assert_eq!(anthropic.usage.input_tokens, 3);
+    }
+
+    /// C-4 的另一半：`"choices": null` 在两个公开入口上同样只该给零内容块。实测此前两者与直接
+    /// `from_str` 一起报 `invalid type: null, expected a sequence`。
+    #[test]
+    fn null_choices_response_yields_zero_blocks_not_a_decode_error() {
+        let null_choices = br#"{"id":"c1","object":"chat.completion","model":"m","choices":null,"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#;
+        let resp = parse_response(null_choices).expect("null choices must not fail the response");
+        assert!(block_types(&resp).is_empty());
+        assert_eq!(resp.id, "c1");
+        assert_eq!(resp.usage.input_tokens, 3);
+        assert_eq!(resp.stop_reason, "");
+
+        let anthropic = parse_openai_response_to_anthropic(null_choices)
+            .expect("null choices must not fail the anthropic projection");
+        assert!(anthropic.content.is_empty());
+        assert_eq!(anthropic.usage.input_tokens, 3);
+    }
+
+    /// 上两条的正向对照，**独立用例**：`choices` 在场时内容块照常产出 —— 证明它们钉的是
+    /// 「缺 choices / null 也能解」，不是「这两条路径从来就不产内容块」。
+    #[test]
+    fn present_choices_still_yield_content_blocks() {
+        let resp =
+            parse_response(TOOLCALL_RESPONSE_WITH_TEXT).expect("choices present must decode");
+        assert_eq!(block_types(&resp), ["text", "tool_use"]);
+        assert_eq!(resp.stop_reason, "tool_use");
+        let anthropic = parse_openai_response_to_anthropic(TOOLCALL_RESPONSE_WITH_TEXT)
+            .expect("choices present must decode");
+        assert_eq!(anthropic.content.len(), 2);
+    }
+
+    #[test]
+    fn null_finish_reason_is_not_a_decode_failure() {
+        let body = br#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":null}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+        let resp = parse_response(body).unwrap();
+        // `null` = 上游没给停止原因，落成空串（`ChatResponse` 的 `stop_reason` 是 `String`，
+        // 空串就是它表达「没有」的形态），绝不伪造一个 `end_turn`。
+        assert_eq!(resp.stop_reason, "");
+        assert_eq!(block_types(&resp), ["text"]);
+        // 负向对照：给了停止原因时照常映射。
+        let stopped = br#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+        assert_eq!(parse_response(stopped).unwrap().stop_reason, "end_turn");
     }
 }

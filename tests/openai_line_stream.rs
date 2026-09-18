@@ -121,6 +121,40 @@ fn finish_chunk(reason: &str) -> String {
     .to_string()
 }
 
+/// 工具调用首片：带 id + name，`arguments` 为空串（OpenAI 规范形态）。
+fn tool_first_chunk(id: &str, name: &str) -> String {
+    json!({
+        "id": "c1",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": { "tool_calls": [{
+                "index": 0,
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": "" },
+            }] },
+            "finish_reason": null,
+        }],
+    })
+    .to_string()
+}
+
+/// 工具调用续片：**只有** index 与 arguments 分片，没有 id / type / name —— OpenAI 规范里每一次
+/// 工具调用从第二帧起都是这个形态。
+fn tool_arg_chunk(args: &str) -> String {
+    json!({
+        "id": "c1",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": args } }] },
+            "finish_reason": null,
+        }],
+    })
+    .to_string()
+}
+
 /// 把全部事件解析为 `(事件名, data JSON)`；任何一项是错误即失败。
 fn parse_ok(items: &[acosmi::Result<StreamEvent>]) -> Vec<(String, Value)> {
     items
@@ -154,6 +188,45 @@ fn expect_single_close_at_end(all: &[(String, Value)]) -> &Value {
     assert_eq!(stop_at, names.len() - 1, "{names:?}");
     assert_eq!(names[stop_at - 1], "message_delta", "{names:?}");
     &all[stop_at - 1].1
+}
+
+#[tokio::test]
+async fn spec_toolcall_stream_reaches_caller_intact() {
+    // 端到端：标准 OpenAI 工具调用流（续片不带 name），整条流必须**零 Err** 地走到 message_stop。
+    // 此前 `OpenAIFunctionCall.name` 必填，第二帧就 `missing field \`name\``，流当场终止、参数一
+    // 字节不落。
+    let items = run(sse(&[
+        &tool_first_chunk("call_1", "get_weather"),
+        &tool_arg_chunk(r#"{"city":"#),
+        &tool_arg_chunk(r#" "SF"}"#),
+        &finish_chunk("tool_calls"),
+        "[DONE]",
+    ]))
+    .await;
+    let errors: Vec<&acosmi::Error> = items.iter().filter_map(|i| i.as_ref().err()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let all = parse_ok(&items);
+    assert_eq!(
+        event_names(&all),
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ]
+    );
+    let args: String = all
+        .iter()
+        .filter(|(name, _)| name == "content_block_delta")
+        .map(|(_, p)| p["delta"]["partial_json"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(args, r#"{"city": "SF"}"#);
+    let delta = expect_single_close_at_end(&all);
+    assert_eq!(delta["delta"], json!({ "stop_reason": "tool_use" }));
 }
 
 #[tokio::test]

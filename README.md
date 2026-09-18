@@ -7,7 +7,7 @@
 
 ## 状态
 
-- 端口自 [`@acosmi/sdk-ts`](https://github.com/acosmi/sdk-ts)（事实标准主实现）。当前 Rust **v4.0.0** 补齐已核验的 TS 2.19 模型网关观察与目录契约；详细范围和迁移见 [3.0 迁移说明](./docs/transport-and-observers.md)。
+- 端口自 [`@acosmi/sdk-ts`](https://github.com/acosmi/sdk-ts)（事实标准主实现）。当前 Rust **v5.0.0** 把 OpenAI 线流式转换器对齐到 TS 参照（工具调用归并键三级降级、`id` / `name` 缺席即省略、流式 usage 独立类型），破坏性变更逐条见 [CHANGELOG](./CHANGELOG.md)。v4.0.0 的严格令牌权威与 custom-only 构建契约不变（见下）；v3.0.0 起的模型网关观察与目录契约见 [3.0 迁移说明](./docs/transport-and-observers.md)。
 - 仅原生运行时（`tokio` + `reqwest`，rustls TLS）；不提供 WASM/浏览器并列构建。
 - 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 - API 参考由 `cargo doc` / [docs.rs](https://docs.rs/acosmi-sdk) 从 `///` 自动生成（Rust 生态惯例，无手写 API 目录）。
@@ -18,7 +18,7 @@
 
 ```toml
 [dependencies]
-acosmi-sdk = "4.0"
+acosmi-sdk = "5.0"
 tokio = { version = "1", features = ["full"] }
 ```
 

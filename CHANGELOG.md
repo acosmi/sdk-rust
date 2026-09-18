@@ -9,19 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
-## [Unreleased]
+## [5.0.0] - 2026-09-17 — OpenAI-line streaming parity with `@acosmi/sdk-ts`
+
+Major because three public wire DTO fields and one emitted event change shape. Everything else in this release is a
+behaviour fix on the OpenAI line; the Anthropic line, `chat_stream` / `chat_stream_with_usage`
+(which pass upstream chunks through without the converter), and every other namespace are untouched.
+
+### Breaking
+
+- `OpenAIFunctionCall.name`: `String` → `Option<String>`, now `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  Per the OpenAI streaming spec only the first chunk of a tool call carries `name`, so "absent" and
+  "the model named an empty function" have to be distinguishable; flattening both to `""` is what put
+  `"name": ""` on the wire. Callers reading the field: `tc.function.name` is now an `Option<String>` —
+  use `tc.function.name.as_deref().unwrap_or_default()` for the old behaviour, or match on it to tell
+  the two cases apart. Callers constructing the struct: wrap the value, `name: Some("f".into())`.
+  Serialization: a `None` name is now omitted from the JSON object instead of written as `"name": ""`.
+- `OpenAIStreamToolCall.index`: `i64` → `Option<i64>`, now `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  As an `i64` an omitted `index` was indistinguishable from `index: 0`, so two tool calls from a
+  provider that omits it shared one block. Callers reading the field get `Option<i64>`; callers
+  constructing it write `index: Some(0)`. Serialization: a `None` index is omitted instead of
+  written as `"index": 0`.
+- `OpenAIStreamChunk.usage`: `Option<OpenAIUsage>` → `Option<OpenAIStreamUsage>`. `OpenAIUsage` requires
+  all three counts as `i64`, which no streaming usage object is obliged to provide, so anyone
+  deserializing the public chunk type directly hit `missing field \`total_tokens\``. `OpenAIUsage`
+  itself is unchanged and still used by the non-streaming `OpenAIChatResponse`. Callers reading
+  streaming usage now get `Option<i64>` per count and must handle absence; an absent count is not 0.
+- `OpenAIStreamConverter` emits `content_block_start` for `tool_use` **without** the `id` / `name`
+  keys when the upstream chunk did not carry them, instead of `"id": ""` / `"name": ""`. Downstream
+  code that treated "the key is present" as "the value is valid" was being handed empty identifiers.
+  Code reading these must now handle the keys being absent. This matches `JSON.stringify` dropping
+  `undefined` in `@acosmi/sdk-ts`.
 
 ### Added
 
+- `OpenAIStreamUsage`, `OpenAIStreamUsagePromptDetails` and `OpenAIStreamUsageCompletionDetails`,
+  mirroring `OpenAIStreamUsage` in `@acosmi/sdk-ts`: every count optional, plus the
+  `prompt_tokens_details` / `completion_tokens_details` objects that providers send. The SDK still
+  maps only `prompt_tokens` and `completion_tokens`, and neither reads nor nets out the details.
 - `OpenAIStreamConverter::flush` emits a stream close that was deferred while waiting for usage, for streams that end without `data: [DONE]`. `chat_messages_stream` calls it once when the response body ends normally; code that drives the converter directly should do the same. It never fabricates a close for a stream that never delivered `finish_reason`, and it is not called after a read error or cancellation.
 
 ### Fixed
 
+- Tool calls from providers that omit `index` no longer collapse into one block. The converter now resolves the block key the way `@acosmi/sdk-ts` does — `index`, else `id:<id>`, else the previously resolved key — so two `index`-less tool calls get two blocks with their own ids, names and arguments instead of one block whose `partial_json` is `{"x":1}{"y":2}`, which no downstream can parse and which loses the second call entirely. The block key and the argument de-duplication key are resolved once, together, from the same call.
+- A `reasoning_content` delta that arrives *after* a text delta now opens its block at the next index. The thinking branch did not close an open text block or advance the block index, so both `content_block_start` events landed on index 0 and the thinking block was never closed — the reverse order (thinking first) was already correct. The same defect was fixed in `@acosmi/sdk-ts` and `acosmi-sdk-go` in the same batch.
+- A stream choice without `delta` yields zero events for that chunk instead of ending the stream with `missing field \`delta\``. TypeScript failed on this shape too; all three SDKs now tolerate it.
+- A non-streaming response without `usage`, or with `"usage": null`, decodes with three zero counts instead of failing the whole response with `missing field \`usage\`` / `invalid type: null, expected struct OpenAIUsage`. Providers that do not settle usage were returning a body whose content was fine but which `parse_response` rejected outright. Absent and `null` say the same thing here — the upstream has no usage data — and now decode the same way.
+- A non-streaming response without `choices`, or with `"choices": null`, decodes to zero content blocks instead of failing the whole response with `missing field \`choices\`` / `invalid type: null, expected a sequence`. `parse_response`, `parse_openai_response_to_anthropic` and direct deserialization of `OpenAIChatResponse` all rejected such a body outright, so `id`, `model` and `usage` were thrown away with it. For the absent key TypeScript threw on `oai.choices.length` too and Go tolerated it; for `null` Rust was the only one of the three that failed, since TypeScript guards with `Array.isArray` and Go decodes it to a nil slice. All three now treat both shapes as an empty list. The stop reason stays empty rather than being fabricated as `end_turn`. A `choices` that is an object or a scalar is still an error here — unlike the streaming chunk, where any non-array shape yields an empty list so that one malformed frame does not end the stream.
 - OpenAI-line streaming usage is no longer dropped. With `stream_options.include_usage` the upstream sends the `finish_reason` chunk, then `{"choices":[],"usage":{...}}`, then `data: [DONE]`. `OpenAIStreamConverter` returned no events for chunks without choices, never read `usage`, and had already emitted `message_delta` (without usage) and `message_stop` on the `finish_reason` chunk, so no OpenAI-line stream from `chat_messages_stream` carried usage. The converter now records the usage object of any chunk, with or without choices (later chunks override earlier ones), and puts it in the `message_delta` immediately before the single `message_stop`.
 - Content blocks still close on the `finish_reason` chunk, but when no usage has been seen yet, `message_delta` and `message_stop` wait for the first of: a chunk carrying usage, `data: [DONE]`, or the end of the body. Only the first `finish_reason` counts. `data: [DONE]` without any `finish_reason` now closes open blocks and ends the message with `end_turn`. No path emits `message_stop` twice.
 - The streaming usage mapping matches the non-streaming one: `prompt_tokens` to `input_tokens`, `completion_tokens` to `output_tokens`. Cached and reasoning token details are neither mapped nor netted out. A count that is missing or not a JSON number is omitted rather than written as 0, and a stream that never carried a usage object has no `usage` key. Usage is read from the raw chunk, so a usage object that does not fit `OpenAIUsage` (for example one without `total_tokens`) no longer fails the chunk.
 - `OpenAIStreamChunk` deserialization accepts chunks without `id`, `object` or `choices`, such as gateway envelope and error-contract frames and usage-only chunks. These previously failed to deserialize and ended the stream with an error. Serialization is unchanged.
 - The OpenAI branch of `chat_messages_stream` now surfaces gateway `failed` / `error` events as `Error::Stream` through `parse_stream_error`, as `chat_stream_with_usage` already did, instead of passing them to the chunk converter.
+- Streaming tool calls no longer end the stream. Per the OpenAI streaming spec only the first tool-call chunk carries `function.name`; every later increment carries just `index` and an `arguments` fragment. `OpenAIFunctionCall.name`, `OpenAIFunctionCall.arguments`, `OpenAIStreamToolCall.function` and `OpenAIStreamChoice.index` were all required, so the second chunk of every OpenAI-line tool call failed to deserialize with `missing field` and `chat_messages_stream` terminated with an error before a single argument byte reached the caller. All four now default when absent, matching the optional reads in `@acosmi/sdk-ts`. (`name` also changed type in this release — see Breaking; `arguments`, `function` and `OpenAIStreamChoice.index` keep their types and serialization.)
+- `function.arguments` accepts a JSON value as well as a string. Some OpenAI-compatible providers send an object; it is now stringified into `partial_json` the way `JSON.stringify` does in TypeScript, instead of failing the chunk with `invalid type: map, expected a string`. A `null` becomes an empty string and emits no delta.
+- Tool-call argument fragments are de-duplicated. Providers that resend the full arguments on every chunk previously produced concatenations such as `{"a":{"a":1{"a":1}`, which no downstream can parse. The converter now tracks what it has emitted per tool block and forwards only the suffix when a fragment is strictly the accumulated text plus more; genuinely incremental streams are still forwarded fragment by fragment.
+- An unlisted `finish_reason` is passed through instead of being flattened to `end_turn`. `content_filter` and `function_call` reached the caller as a normal end of turn, which made a content-policy block indistinguishable from a completed answer. `stop`, `tool_calls` and `length` still map to `end_turn`, `tool_use` and `max_tokens`.
+- A `choices` value that is not an array (an object, `null` or a scalar from a malformed upstream or gateway frame) yields zero events for that chunk instead of ending the stream with `invalid type: map, expected a sequence`, matching the `Array.isArray` guard in TypeScript.
+- Non-streaming responses whose `message.content` is `null` or absent now decode. `"content": null` is the standard OpenAI shape for a tool-call-only response, and it failed with `invalid type: null, expected a string`, so `parse_response` and `parse_openai_response_to_anthropic` rejected the most common tool-calling reply outright. Empty content produces no text block, matching the truthiness guard in TypeScript. A `null` or absent `finish_reason` likewise decodes to an empty stop reason instead of failing the whole response.
 
 Streaming semantics now match `@acosmi/sdk-ts` 2.19.3 (gateway failure events on the OpenAI line) and 2.19.4 (usage tail chunk and `flush`) for these paths.
 
