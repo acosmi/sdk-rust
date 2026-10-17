@@ -89,10 +89,12 @@ pub use crate::models::{
     OpenAIChatResponse, OpenAIFunctionCall, OpenAIStreamChoice, OpenAIStreamChunk,
     OpenAIStreamConverter, OpenAIStreamDelta, OpenAIStreamToolCall, OpenAIStreamUsage,
     OpenAIStreamUsageCompletionDetails, OpenAIStreamUsagePromptDetails, OpenAIToolCall,
-    OpenAIUsage, OutputConfig, ProviderFormat, QuotaSummary, RerankDocument, RerankQuery,
-    RerankRequest, RerankResponse, RerankResult, ServerTool, SourcesEvent, SourcesEventIssueCode,
-    SourcesEventParseResult, StreamEvent, StreamSettlement, ThinkingConfig, VideoGenerationRequest,
-    VideoTaskResponse, WebSearchConfig, WebSearchSource, MAX_END_USER_ID_LENGTH,
+    OpenAIUsage, OutputConfig, ProviderFormat, QuotaSummary, QuotaSummaryFreePool,
+    QuotaSummarySubscriptionPool, RerankDocument, RerankQuery, RerankRequest, RerankResponse,
+    RerankResult, ServerTool, SourcesEvent, SourcesEventIssueCode, SourcesEventParseResult,
+    StreamEvent, StreamSettlement, ThinkingConfig, VideoGenerationRequest, VideoTaskResponse,
+    WebSearchConfig, WebSearchSource, WindowLimitStatus, CREDIT_UNIT_COST_CNY,
+    CREDIT_UNIT_OFFICIAL_CNY, MAX_END_USER_ID_LENGTH, QUOTA_UNIT_MICRO_CREDIT,
     SERVER_TOOL_TYPE_WEB_SEARCH, THINKING_HIGH, THINKING_MAX, THINKING_OFF,
 };
 // === billing 域逐项 re-export（对齐 billing/index.ts）===

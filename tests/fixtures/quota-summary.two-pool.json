@@ -1,0 +1,89 @@
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "freeTotalEtu": 750000,
+    "paidTotalEtu": 40700000000,
+    "freeBuckets": [
+      {
+        "bucketId": "gen-1",
+        "modelId": "*",
+        "bucketClass": "GENERIC",
+        "tokenQuota": 1000000,
+        "tokenUsed": 250000,
+        "tokenRemaining": 750000,
+        "expiresAt": "2026-11-30T00:00:00Z"
+      },
+      {
+        "bucketId": "gen-2",
+        "modelId": "*",
+        "bucketClass": "GENERIC",
+        "tokenQuota": 500000,
+        "tokenUsed": 500000,
+        "tokenRemaining": 0,
+        "expiresAt": "2026-09-01T00:00:00Z",
+        "expired": true
+      }
+    ],
+    "paidBuckets": [
+      {
+        "bucketId": "sub-1",
+        "modelId": "*",
+        "bucketClass": "COMMERCIAL",
+        "tokenQuota": 39900000000,
+        "tokenUsed": 4200000000,
+        "tokenRemaining": 35700000000,
+        "expiresAt": "2026-11-17T00:00:00Z"
+      },
+      {
+        "bucketId": "boost-1",
+        "modelId": "*",
+        "bucketClass": "COMMERCIAL",
+        "tokenQuota": 5000000000,
+        "tokenUsed": 0,
+        "tokenRemaining": 5000000000,
+        "expiresAt": "2026-12-10T00:00:00Z"
+      }
+    ],
+    "nextFreeExpiresAt": "2026-11-30T00:00:00Z",
+    "nextPaidExpiresAt": "2026-11-17T00:00:00Z",
+    "subscriptionPool": {
+      "quota": 44900000000,
+      "used": 4200000000,
+      "remaining": 40700000000,
+      "expiresAt": "2026-11-17T00:00:00Z",
+      "unit": "MICRO_CREDIT",
+      "boosterRemaining": 5000000000,
+      "boosterCount": 1,
+      "boosterNextExpiresAt": "2026-12-10T00:00:00Z"
+    },
+    "windowLimits": [
+      {
+        "kind": "FIVE_HOUR",
+        "limitCredits": 4788000000,
+        "usedCredits": 120000000,
+        "resetAt": "2026-10-17T15:00:00Z",
+        "overridable": true,
+        "fiveHourSoftContinuing": false,
+        "inflightHeldCredits": 30000000
+      },
+      {
+        "kind": "WEEKLY",
+        "limitCredits": 20947500000,
+        "usedCredits": 900000000,
+        "overridable": false,
+        "fiveHourSoftContinuing": false
+      }
+    ],
+    "windowFiveHourContinueEnabled": true,
+    "freePool": {
+      "quota": 19950000000,
+      "used": 500000000,
+      "remaining": 19450000000,
+      "expiresAt": "2026-11-17T00:00:00Z",
+      "unit": "MICRO_CREDIT",
+      "eligibleModels": ["deepseek-flash", "qwen3.7-flash", "ZHIPU/GLM-5.3-Flash"]
+    },
+    "creditUnit": "OFFICIAL_CNY"
+  }
+}

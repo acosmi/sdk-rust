@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 跨语言契约（snake_case wire-format / 符号名对齐 / bug-for-bug 行为）见
 [`docs/开发与发布手册.md`](./docs/开发与发布手册.md) §5。
 
+## [6.0.0] - 2026-10-17 — Subscription two-pool display contract (aligned with `@acosmi/sdk-ts` 2.20.0)
+
+Major **only** because public wire DTO structs gain fields (the repo rule, `docs/开发与发布手册.md`: extending a public
+struct needs a Rust major). The wire format is purely additive: every new key is optional, an old gateway simply omits
+it, and an old client keeps decoding new responses unchanged (design decision D-14 of the two-pool plan).
+
+### Breaking (source level only)
+
+- `QuotaSummary` and `ManagedModel` gained fields, so code that builds them with a struct literal and no
+  `..Default::default()` stops compiling. Add the spread (`QuotaSummary { free_total_etu: 1, ..Default::default() }`);
+  nothing about reading, deserializing or serializing changes. Reading code is unaffected.
+
+### Added
+
+- `QuotaSummary.free_pool: Option<QuotaSummaryFreePool>` (wire `freePool`) — the **featured free pool F** that a paid
+  contract carries with every subscription period: `quota` / `used` / `remaining` (micro-Credits, ÷1000 = Credits),
+  optional `expires_at`, `unit` (`"MICRO_CREDIT"`), `eligible_models` (FREE ∪ still-promoted PROMO_FREE model ids, may
+  be an empty array). F is spent first by those models; when it runs out the same request overflows into the paid
+  pool P. **`None` means the contract has no F, or the gateway predates F — neither may be read as 0.**
+- `QuotaSummary.credit_unit: Option<String>` (wire `creditUnit`) — the unit of every Credit number in the response:
+  `"OFFICIAL_CNY"` (new contract, 1 Credit = ¥0.000001 list price) or `"COST_CNY"` (old contract). `None` = old
+  gateway; never default it to either value. Constants: `CREDIT_UNIT_OFFICIAL_CNY`, `CREDIT_UNIT_COST_CNY`,
+  `QUOTA_UNIT_MICRO_CREDIT`.
+- `ManagedModel.free_pool_eligible: Option<bool>` (wire `freePoolEligible`) — whether this model is spent from F first
+  (the "featured" badge). `None` = old gateway, not `Some(false)`; draw the badge only on `== Some(true)`.
+- Fields the gateway already sent but this crate did not model, needed for a lossless contract round trip:
+  `QuotaSummary.subscription_pool` (`QuotaSummarySubscriptionPool`, including the booster triple),
+  `QuotaSummary.window_limits` (`Vec<WindowLimitStatus>`), `QuotaSummary.window_five_hour_continue_enabled`.
+  `subscription_pool` keeps its meaning: it is the paid pool P.
+- Contract fixtures under `tests/fixtures/` (`quota-summary.{two-pool,legacy}.json`,
+  `managed-models.{two-pool,legacy}.json`) — byte-identical copies of the TS and Go ones — and
+  `tests/quota_summary_two_pool.rs`, which pins the three absent-is-not-zero cases, the lossless round trip in both
+  directions, and tamper rejection.
+
+### Clarified (no behaviour change)
+
+- `ManagedModel.free_tier` keeps its meaning ("inside the PLAN:FREE allow-list") but is no longer the basis for any
+  display partition; use `free_pool_eligible`. `QuotaSummary.free_total_etu` / `free_buckets` are GENERIC gift buckets
+  and are **not** `free_pool`; the two must not be added together.
+
 ## [5.0.0] - 2026-09-17 — OpenAI-line streaming parity with `@acosmi/sdk-ts`
 
 Major because three public wire DTO fields and one emitted event change shape. Everything else in this release is a

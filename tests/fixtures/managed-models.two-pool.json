@@ -1,0 +1,202 @@
+{
+  "code": 0,
+  "message": "success",
+  "data": [
+    {
+      "id": "m-ds-flash",
+      "name": "DeepSeek V4.1 Flash",
+      "modelId": "deepseek-flash",
+      "provider": "deepseek",
+      "maxTokens": 65536,
+      "contextWindow": 1000000,
+      "capabilities": {
+        "supports_thinking": true,
+        "supports_adaptive_thinking": false,
+        "supports_isp": false,
+        "supports_web_search": false,
+        "supports_tool_search": false,
+        "supports_structured_output": true,
+        "supports_effort": true,
+        "supports_max_effort": true,
+        "supports_fast_mode": false,
+        "supports_auto_mode": false,
+        "supports_1m_context": false,
+        "supports_prompt_cache": true,
+        "supports_cache_editing": false,
+        "supports_token_efficient": false,
+        "supports_redact_thinking": false,
+        "supports_desktop_visual_understanding": false,
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 65536,
+        "supports_embedding": false,
+        "supports_rerank": false
+      },
+      "thinking_levels": [
+        "off",
+        "high",
+        "max"
+      ],
+      "inputModalities": [
+        "text"
+      ],
+      "isEnabled": true,
+      "minPlanTier": 0,
+      "chatRuntimeSupported": true,
+      "supported_formats": [
+        "anthropic",
+        "openai"
+      ],
+      "preferred_format": "anthropic",
+      "locked": false,
+      "freeTier": true,
+      "freePoolEligible": true
+    },
+    {
+      "id": "m-glm-flash",
+      "name": "GLM-5.3 Flash",
+      "modelId": "ZHIPU/GLM-5.3-Flash",
+      "provider": "zhipu",
+      "maxTokens": 65536,
+      "contextWindow": 200000,
+      "capabilities": {
+        "supports_thinking": true,
+        "supports_adaptive_thinking": false,
+        "supports_isp": false,
+        "supports_web_search": false,
+        "supports_tool_search": false,
+        "supports_structured_output": true,
+        "supports_effort": true,
+        "supports_max_effort": true,
+        "supports_fast_mode": false,
+        "supports_auto_mode": false,
+        "supports_1m_context": false,
+        "supports_prompt_cache": true,
+        "supports_cache_editing": false,
+        "supports_token_efficient": false,
+        "supports_redact_thinking": false,
+        "supports_desktop_visual_understanding": false,
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 65536,
+        "supports_embedding": false,
+        "supports_rerank": false
+      },
+      "thinking_levels": [
+        "off",
+        "high",
+        "max"
+      ],
+      "inputModalities": [
+        "text"
+      ],
+      "isEnabled": true,
+      "minPlanTier": 0,
+      "chatRuntimeSupported": true,
+      "supported_formats": [
+        "anthropic",
+        "openai"
+      ],
+      "preferred_format": "anthropic",
+      "locked": false,
+      "freeTier": false,
+      "freePoolEligible": true
+    },
+    {
+      "id": "m-qwen-max",
+      "name": "Qwen3.8 Max",
+      "modelId": "qwen3.8-max",
+      "provider": "dashscope",
+      "maxTokens": 65536,
+      "contextWindow": 262144,
+      "capabilities": {
+        "supports_thinking": true,
+        "supports_adaptive_thinking": false,
+        "supports_isp": false,
+        "supports_web_search": false,
+        "supports_tool_search": false,
+        "supports_structured_output": true,
+        "supports_effort": true,
+        "supports_max_effort": true,
+        "supports_fast_mode": false,
+        "supports_auto_mode": false,
+        "supports_1m_context": false,
+        "supports_prompt_cache": true,
+        "supports_cache_editing": false,
+        "supports_token_efficient": false,
+        "supports_redact_thinking": false,
+        "supports_desktop_visual_understanding": false,
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 65536,
+        "supports_embedding": false,
+        "supports_rerank": false
+      },
+      "thinking_levels": [
+        "off",
+        "high",
+        "max"
+      ],
+      "inputModalities": [
+        "text"
+      ],
+      "isEnabled": true,
+      "minPlanTier": 1,
+      "chatRuntimeSupported": true,
+      "supported_formats": [
+        "anthropic",
+        "openai"
+      ],
+      "preferred_format": "anthropic",
+      "locked": false,
+      "freeTier": false,
+      "freePoolEligible": false
+    },
+    {
+      "id": "m-kimi-k3",
+      "name": "Kimi K3",
+      "modelId": "kimi-k3",
+      "provider": "moonshot",
+      "maxTokens": 65536,
+      "contextWindow": 262144,
+      "capabilities": {
+        "supports_thinking": true,
+        "supports_adaptive_thinking": false,
+        "supports_isp": false,
+        "supports_web_search": false,
+        "supports_tool_search": false,
+        "supports_structured_output": true,
+        "supports_effort": true,
+        "supports_max_effort": true,
+        "supports_fast_mode": false,
+        "supports_auto_mode": false,
+        "supports_1m_context": false,
+        "supports_prompt_cache": true,
+        "supports_cache_editing": false,
+        "supports_token_efficient": false,
+        "supports_redact_thinking": false,
+        "supports_desktop_visual_understanding": false,
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 65536,
+        "supports_embedding": false,
+        "supports_rerank": false
+      },
+      "thinking_levels": [
+        "off",
+        "high",
+        "max"
+      ],
+      "inputModalities": [
+        "text"
+      ],
+      "isEnabled": true,
+      "minPlanTier": 1,
+      "chatRuntimeSupported": true,
+      "supported_formats": [
+        "anthropic",
+        "openai"
+      ],
+      "preferred_format": "anthropic",
+      "locked": true,
+      "freeTier": false,
+      "freePoolEligible": false
+    }
+  ]
+}

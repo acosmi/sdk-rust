@@ -437,9 +437,24 @@ pub struct ManagedModel {
     /// 该模型对当前用户档位是否被限制策略锁定。true=展示但置灰+升级引导。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked: Option<bool>,
-    /// 是否属于"免费会员可用"分区（仅分类，与当前用户档位无关）。
+    /// 是否属于"免费会员可用"分区（PLAN:FREE 档 allowedModels 内，仅分类，与当前用户档位无关）。
+    ///
+    /// **语义不变，但不再是展示分区依据**：订阅双池之后「哪些模型先扣精选免费池」由
+    /// [`ManagedModel::free_pool_eligible`] 表达，两套集合可以不一致。新代码不要再用本字段分区或打
+    /// "精选"角标；字段保留只为老客户端零破坏（方案 D-14）。
     #[serde(rename = "freeTier", default, skip_serializing_if = "Option::is_none")]
     pub free_tier: Option<bool>,
+    /// \[订阅双池 P5 / D-14\] 该模型此刻是否有资格先扣**精选免费池 F**（池类 FREE，或仍在限免期内的
+    /// PROMO_FREE）；与 [`QuotaSummaryFreePool::eligible_models`] 同源。用于模型选择器的"精选"角标。
+    ///
+    /// **缺席（`None`）= 老网关（还没有双池），不是 `Some(false)`**：只在 `== Some(true)` 时画角标，
+    /// 绝不在 `!= Some(false)` 时画。限免到期会让同一模型随时间从 `true` 翻成 `false`，不要缓存跨过限免截止日。
+    #[serde(
+        rename = "freePoolEligible",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub free_pool_eligible: Option<bool>,
 
     /// 上游 gateway 为此模型启用的请求格式列表："anthropic" | "openai"。
     /// 空值表示上游未声明，SDK 回落 provider 硬编码分支（向后兼容）。
@@ -514,7 +529,100 @@ pub fn bucket_row_is_commercial(r: Option<&BucketRow>) -> bool {
     }
 }
 
+/// 订阅池视图 —— `QuotaSummary.subscriptionPool`，语义 = **付费池 P**（alive COMMERCIAL 桶合计）。
+///
+/// quota / used / remaining 单位为微 Credits（÷1000 = Credits）。`expires_at` 缺席 = 全是永久桶。
+/// 合计额度为 0 的池网关不下发（客户端按 used/quota 画百分比，0 配额会被画成"已用满"）。
+///
+/// `booster_*` 三件套（加油包份额）是追加式可选：缺席 = 没有加油包，或扣费通老到不下发 sourceType ——
+/// 两种都不可当 0 读；展示端的合同是"三个字段齐全才渲染副行"。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaSummarySubscriptionPool {
+    pub quota: i64,
+    pub used: i64,
+    pub remaining: i64,
+    #[serde(rename = "expiresAt", default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// 网关下发的单位标识（`"MICRO_CREDIT"`）。
+    pub unit: String,
+    #[serde(
+        rename = "boosterRemaining",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub booster_remaining: Option<i64>,
+    #[serde(
+        rename = "boosterCount",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub booster_count: Option<i64>,
+    #[serde(
+        rename = "boosterNextExpiresAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub booster_next_expires_at: Option<String>,
+}
+
+/// 精选免费池 F（订阅双池 P5 / D-14）—— `QuotaSummary.freePool`，与 [`QuotaSummarySubscriptionPool`] 同单位。
+///
+/// 付费合同有 F 池时下发，老合同没有 F 时 `QuotaSummary.free_pool` 整体为 `None`。`expires_at` 可缺席
+/// （口径同 `QuotaSummarySubscriptionPool::expires_at`）。`eligible_models` = 池类 FREE ∪ 仍在限免期的
+/// PROMO_FREE 的 model id，**可以是空数组** —— `[]` 是网关明确说"此刻没有任何模型有资格"，与整个
+/// `free_pool` 缺席不同。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaSummaryFreePool {
+    pub quota: i64,
+    pub used: i64,
+    pub remaining: i64,
+    #[serde(rename = "expiresAt", default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// 恒为 `"MICRO_CREDIT"`（÷1000 = Credits）。
+    pub unit: String,
+    #[serde(rename = "eligibleModels", default)]
+    pub eligible_models: Vec<String>,
+}
+
+/// 单窗口限额用量 —— `QuotaSummary.windowLimits` 元素（与 hold 阶段窗口闸同源）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WindowLimitStatus {
+    /// `FIVE_HOUR` | `WEEKLY`
+    pub kind: String,
+    #[serde(rename = "limitCredits")]
+    pub limit_credits: i64,
+    #[serde(rename = "usedCredits")]
+    pub used_credits: i64,
+    /// 预计恢复时间（ISO-8601 UTC）；窗口内无用量时缺席。
+    #[serde(rename = "resetAt", default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+    /// 该窗此刻可否被用户"继续"开关豁免（5h 软限额时 true；周窗恒 false）。老网关缺席。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overridable: Option<bool>,
+    /// 服务端合成位：该窗已用满，但用户的"继续"开关正在放行。新网关恒下发，老网关缺席（缺席 ≠ false）。
+    #[serde(
+        rename = "fiveHourSoftContinuing",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub five_hour_soft_continuing: Option<bool>,
+    /// 窗口内在途预占（微 Credits）；缺席 = 不知道（老扣费通/取数失败），不能当 0 读；`Some(0)` 是事实。
+    #[serde(
+        rename = "inflightHeldCredits",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inflight_held_credits: Option<i64>,
+}
+
 /// `GET /api/v4/entitlements/quota-summary` 返回体。
+///
+/// 「免费」一词有两层含义，不可混用：`free_total_etu` / `free_buckets` 是 GENERIC（注册赠送 / 邀请奖励 /
+/// 试用）桶，与订阅合同无关；订阅合同自带的精选免费池是 [`QuotaSummary::free_pool`]（订阅双池 P5 / D-14），
+/// 两者不可相加。
+///
+/// 追加式字段（全部可选，老网关缺席；缺席一律不可当 0 读）：`subscription_pool` / `window_limits` /
+/// `window_five_hour_continue_enabled` / `free_pool` / `credit_unit`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuotaSummary {
     /// GENERIC（免费/赠送）alive 桶 tokenRemaining 求和。
@@ -543,7 +651,53 @@ pub struct QuotaSummary {
         skip_serializing_if = "Option::is_none"
     )]
     pub next_paid_expires_at: Option<String>,
+    /// 订阅额度池 = **付费池 P**，订阅双池之后语义不变。`None` = 老网关，或当前没有 alive 付费桶。
+    #[serde(
+        rename = "subscriptionPool",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subscription_pool: Option<QuotaSummarySubscriptionPool>,
+    /// 滚动窗口限额用量（5 小时 / 7 天）；网关未启用窗口限额时整个字段缺席。
+    #[serde(
+        rename = "windowLimits",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub window_limits: Option<Vec<WindowLimitStatus>>,
+    /// 用户 5h"继续"开关现值（true = 软限额/默认；false = 严格模式）；仅网关启用窗口限额时下发。
+    #[serde(
+        rename = "windowFiveHourContinueEnabled",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub window_five_hour_continue_enabled: Option<bool>,
+    /// \[订阅双池 P5 / D-14\] 精选免费池 F：付费合同随每个订阅周期自带的那一半额度，只能被
+    /// `eligible_models` 里的模型先扣，用完后同一请求自动溢出扣付费池 P（`subscription_pool`）。
+    ///
+    /// **`None` = 老合同（没有 F）或老网关（不认识 F）—— 两种都不可当 0 读**：把 `None` 画成
+    /// "精选额度 0 / 已用满"，是在向老合同用户断言一件不存在的事。展示端只在 `free_pool.is_some()` 时画第二条进度条。
+    #[serde(rename = "freePool", default, skip_serializing_if = "Option::is_none")]
+    pub free_pool: Option<QuotaSummaryFreePool>,
+    /// \[订阅双池 P5 / D-14\] 本响应所有 Credit 数值的计量口径：`"OFFICIAL_CNY"`（新合同，
+    /// 1 Credit = ¥0.000001 官方价）或 `"COST_CNY"`（老合同，成本口径）。
+    ///
+    /// **`None` = 老网关没下发，不能当任一取值读**，尤其不能默认成 `OFFICIAL_CNY` 去乘 ¥ 单价。
+    /// 保持 `Option<String>`（开放）：网关将来新增口径时旧版 SDK 原样透出，消费端对未知值应按"不换算"处理。
+    #[serde(
+        rename = "creditUnit",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credit_unit: Option<String>,
 }
+
+/// 额度单位：付费池 / 精选免费池 `quota/used/remaining` 的单位（微 Credit，÷1000 = Credits）。
+pub const QUOTA_UNIT_MICRO_CREDIT: &str = "MICRO_CREDIT";
+/// 计量口径：新合同，1 Credit = ¥0.000001 官方价（¥1 = 10⁹ 微 Credit）。
+pub const CREDIT_UNIT_OFFICIAL_CNY: &str = "OFFICIAL_CNY";
+/// 计量口径：老合同，成本口径。
+pub const CREDIT_UNIT_COST_CNY: &str = "COST_CNY";
 
 // =============================================================================
 // Chat
