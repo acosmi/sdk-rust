@@ -214,6 +214,6 @@ mod scaffold_tests {
 
     #[test]
     fn version_is_wired() {
-        assert_eq!(VERSION, "5.0.0");
+        assert_eq!(VERSION, "6.0.0");
     }
 }
