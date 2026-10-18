@@ -2,9 +2,13 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 
 root = pathlib.Path(__file__).resolve().parents[2]
+# Expected crate version comes from the SDK's own Cargo.toml so a release bump cannot leave this
+# consumer asserting a stale literal (6.0.0 CI red: the script still said "5.0.0").
+expected_version = re.search(r'^version\s*=\s*"([^"]+)"', (root / "Cargo.toml").read_text(), re.M).group(1)
 consumer = root / "target" / "custom-consumer"
 (consumer / "src").mkdir(parents=True, exist_ok=True)
 (consumer / "Cargo.toml").write_text(
@@ -31,10 +35,10 @@ fn main()->acosmi::Result<()> {
     let mut token=TokenSet {access_token:"canary".into(),refresh_token:"canary".into(),expires_at:String::new(),scope:String::new(),client_id:String::new(),server_url:String::new()};
     zeroize::Zeroize::zeroize(&mut token);
     assert!(token.access_token.is_empty());
-    assert_eq!(acosmi::VERSION,"5.0.0");
+    assert_eq!(acosmi::VERSION,"__EXPECTED_VERSION__");
     Ok(())
 }
-""")
+""".replace("__EXPECTED_VERSION__", expected_version))
 env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target" / "custom-consumer-build"))
 command = ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(consumer / "Cargo.toml")]
 metadata = json.loads(subprocess.check_output(command, env=env))
